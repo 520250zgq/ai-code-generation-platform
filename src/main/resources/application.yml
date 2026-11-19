@@ -1,0 +1,171 @@
+spring:
+  # 本地密钥文件位于项目根目录，存在时自动加载；缺失时忽略，不影响测试和部署。
+  # 生产环境请使用环境变量或外部配置文件，不要把真实密钥提交到版本库。
+  config:
+    import: optional:file:./application-local.yml
+  # Redis：Session 与对话记忆共用同一套连接配置，通过不同的 key 前缀隔离。
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: ${REDIS_DATABASE:0}
+      timeout: 3s
+
+  # Spring Session：登录态由 Redis 统一存储，服务重启或多实例部署后无需重新登录。
+  session:
+    timeout: 7d
+    data:
+      redis:
+        namespace: zgq:ai-code-mother:session
+        flush-mode: on-save
+        save-mode: on-set-attribute
+        # 默认的 RedisSessionRepository 不依赖 keyspace 通知，避免托管 Redis 禁用 CONFIG 时启动告警。
+        configure-action: none
+
+  profiles:
+    active: local
+  # mysql
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/yu-ai-code-mother
+    username: ${MYSQL_USERNAME:root}
+    # 真实密码放在本地 application-local.yml 或环境变量中，避免提交到版本库。
+    password: ${MYSQL_PASSWORD:}
+
+  application:
+    name: zgq-ai-code-mother-backend
+
+server:
+  port: 8123
+  servlet:
+    context-path: /api
+    session:
+      cookie:
+        # 自定义 Cookie 名，避免同一域名下与其他应用的 JSESSIONID 冲突。
+        name: ZGQ_SESSION
+        http-only: true
+        # 前后端同站部署（含 localhost 不同端口）使用 Lax；跨站部署需改为 none 并启用 HTTPS。
+        same-site: lax
+        max-age: 7d
+
+app:
+  deploy:
+    host: ${APP_DEPLOY_HOST:http://localhost}
+  # 腾讯云 COS：截图上传后返回公共访问 URL。密钥通过环境变量或 application-local.yml 注入。
+  cos:
+    secret-id: ${COS_SECRET_ID:}
+    secret-key: ${COS_SECRET_KEY:}
+    region: ${COS_REGION:ap-guangzhou}
+    bucket: ${COS_BUCKET:zgq-ai-code-father-1528961224}
+    key-prefix: ${COS_KEY_PREFIX:screenshot/}
+    domain: ${COS_DOMAIN:}
+    public-read: ${COS_PUBLIC_READ:true}
+  # AI 工作流：图片收集、提示词增强、智能路由、代码生成和项目构建。
+  # 所有密钥都从环境变量读取，未配置时对应渠道自动降级，不影响应用启动。
+  workflow:
+    enabled: ${WORKFLOW_ENABLED:true}
+    max-concurrent-runs: ${WORKFLOW_MAX_CONCURRENT_RUNS:4}
+    code-generation-timeout: ${WORKFLOW_CODE_GENERATION_TIMEOUT:10m}
+    image-collection-timeout: ${WORKFLOW_IMAGE_COLLECTION_TIMEOUT:4m}
+    max-total-images: ${WORKFLOW_MAX_TOTAL_IMAGES:12}
+    content-image:
+      # auto / pexels / pixabay / unsplash / mock；auto 会按顺序选择已配置密钥的渠道。
+      provider: ${WORKFLOW_IMAGE_PROVIDER:auto}
+      per-page: ${WORKFLOW_IMAGE_PER_PAGE:3}
+      max-tasks: ${WORKFLOW_IMAGE_MAX_TASKS:1}
+      pexels:
+        api-key: ${PEXELS_API_KEY:}
+      pixabay:
+        api-key: ${PIXABAY_API_KEY:}
+      unsplash:
+        access-key: ${UNSPLASH_ACCESS_KEY:}
+      fallback:
+        enabled: ${WORKFLOW_IMAGE_FALLBACK_ENABLED:true}
+    undraw:
+      enabled: ${UNDRAW_ENABLED:true}
+      per-page: ${UNDRAW_PER_PAGE:3}
+      max-tasks: ${UNDRAW_MAX_TASKS:1}
+    mermaid:
+      enabled: ${MERMAID_ENABLED:true}
+      # 需要先安装 @mermaid-js/mermaid-cli；Windows 下可以是 mmdc、mmdc.cmd 或完整路径。
+      command: ${MERMAID_CLI:mmdc}
+      output-format: ${MERMAID_OUTPUT_FORMAT:png}
+      timeout: ${MERMAID_TIMEOUT:120s}
+      width: ${MERMAID_WIDTH:1600}
+      height: ${MERMAID_HEIGHT:900}
+      background: ${MERMAID_BACKGROUND:transparent}
+      theme: ${MERMAID_THEME:default}
+      puppeteer-args: ${MERMAID_PUPPETEER_ARGS:--no-sandbox,--disable-setuid-sandbox}
+      # 可选：复用本机 Chrome，避免 Puppeteer 重复下载浏览器。
+      puppeteer-executable-path: ${PUPPETEER_EXECUTABLE_PATH:}
+      allow-external-resources: ${MERMAID_ALLOW_EXTERNAL_RESOURCES:false}
+      cos-prefix: ${MERMAID_COS_PREFIX:workflow/diagrams/}
+      max-tasks: ${MERMAID_MAX_TASKS:2}
+    logo:
+      enabled: ${LOGO_ENABLED:true}
+      # 阿里云百炼（DashScope）API Key，未配置时跳过 Logo 生成。
+      api-key: ${DASHSCOPE_API_KEY:}
+      model: ${DASHSCOPE_IMAGE_MODEL:wan2.2-t2i-flash}
+      size: ${DASHSCOPE_IMAGE_SIZE:512*512}
+      timeout: ${DASHSCOPE_TIMEOUT:3m}
+      poll-interval: ${DASHSCOPE_POLL_INTERVAL:2s}
+      max-poll-attempts: ${DASHSCOPE_MAX_POLL_ATTEMPTS:60}
+      store-to-cos: ${LOGO_STORE_TO_COS:true}
+      cos-prefix: ${LOGO_COS_PREFIX:workflow/logos/}
+      max-tasks: ${LOGO_MAX_TASKS:1}
+  # 对话记忆：Redis 保存最近若干条消息，本地只缓存热点会话，未命中时回源 Redis 或 MySQL。
+  chat-memory:
+    ttl: 7d
+    # Vue 工具调用每一轮都会产生“工具请求 + 工具结果”两条消息，
+    # 窗口过小会让模型忘记已经写过哪些文件、从而反复调用工具，这里放宽到 100 条。
+    max-messages: 100
+    max-cached-conversations: 100
+    key-prefix: "zgq:ai-code-mother:chat-memory:"
+
+# springdoc-openapi
+springdoc:
+  group-configs:
+    - group: 'default'
+      packages-to-scan: com.zgq.zgqaicodemother.controller
+
+# knife4j
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+
+langchain4j:
+  open-ai:
+    streaming-chat-model:
+      base-url: https://api.deepseek.com
+      # 真实密钥放在本地 application-local.yml 或环境变量 DEEPSEEK_API_KEY 中。
+      api-key: ${DEEPSEEK_API_KEY:}
+      model-name: deepseek-chat
+      # 带对话记忆的二次改写会重新输出完整 HTML/CSS/JS，8K 容易在 CSS 中途截断。
+      max-tokens: 16384
+      log-requests: true
+      log-responses: true
+    # 智能路由：分类任务只需要输出一个枚举值，使用独立的小模型/低输出上限降低创建应用的成本和延迟。
+    # 不能为路由模型配置 response-format（json_object/json_schema），否则枚举格式指令会失效。
+    # 生产环境可通过 ROUTING_AI_MODEL_NAME、ROUTING_AI_BASE_URL、ROUTING_AI_API_KEY 换成更便宜更快的模型。
+    routing-chat-model:
+      base-url: ${ROUTING_AI_BASE_URL:${langchain4j.open-ai.streaming-chat-model.base-url:https://api.deepseek.com}}
+      api-key: ${ROUTING_AI_API_KEY:${langchain4j.open-ai.streaming-chat-model.api-key}}
+      model-name: ${ROUTING_AI_MODEL_NAME:deepseek-chat}
+      # 部分推理模型会先消耗 reasoning token，32 可能只够思考、不够输出枚举值；留出少量余量。
+      max-tokens: 256
+      temperature: 0
+      timeout: 10s
+      max-retries: 0
+      log-requests: false
+      log-responses: false
+    # Vue 工程模式使用独立的推理模型配置，默认复用上面的 base-url 和 api-key。
+    # 生产环境可把 model-name 换成 deepseek-reasoner，并把 max-tokens 调大到 32768。
+    reasoning-streaming-chat-model:
+      model-name: deepseek-chat
+      # deepseek-chat 单次输出上限为 8K；工具调用每次只写一个文件，8K 足够一轮使用。
+      max-tokens: 8192
+      timeout: 180s
+      log-requests: false
+      log-responses: false

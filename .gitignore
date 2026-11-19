@@ -1,0 +1,43 @@
+HELP.md
+target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+
+### CUSTOM ###
+application-local.yml
+.tmp
+# 运行期生成的应用代码、部署文件和网页截图
+tmp/
+# 本地调试临时文件（Cookie 抓包、classpath 导出等），不要提交
+cookies-cmd.txt
+cp.txt
+tmp_ref_tree.txt
