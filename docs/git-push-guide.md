@@ -161,6 +161,7 @@ ssh -vT git@github.com
 
 - 确认公钥已添加到**正确的 GitHub 账号**（本仓库为 `520250zgq`）。
 - 确认 `~/.ssh/config` 没有把 `github.com` 指向其他密钥。
+- 如果 `ssh -vT git@github.com` 显示 `Server accepts key` 之后仍然被拒绝，通常是私钥设置了口令但当前没有 ssh-agent 解锁，见 8.1.1。
 - 使用多把密钥时，可在 `~/.ssh/config` 中显式指定：
 
 ```text
@@ -170,6 +171,36 @@ Host github.com
   IdentityFile ~/.ssh/id_ed25519
   IdentitiesOnly yes
 ```
+
+### 8.1.1 忘记密钥口令（passphrase）
+
+`passphrase` 是创建密钥时可选设置的私钥保护口令，**不是 GitHub 登录密码**。它只用于解锁本机的私钥文件，忘记后无法找回，也不需要找回，直接生成一把新密钥即可：
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_github -N "" -C "github-你的账号"
+```
+
+1. 把新生成的 `~/.ssh/id_ed25519_github.pub` 内容添加到 GitHub（Settings → SSH and GPG keys → New SSH key）。
+2. 让当前仓库使用新密钥。`core.sshCommand` 只写入 `.git/config`，不会被提交：
+
+```bash
+git config core.sshCommand "ssh -i ~/.ssh/id_ed25519_github -o IdentitiesOnly=yes"
+```
+
+Windows PowerShell 下路径建议使用正斜杠：
+
+```powershell
+git config core.sshCommand 'ssh -i "C:/Users/<用户名>/.ssh/id_ed25519_github" -o IdentitiesOnly=yes'
+```
+
+3. 验证并推送：
+
+```bash
+ssh -T git@github.com
+git push -u origin main
+```
+
+> 生成时 `-N ""` 表示不设置口令，适合个人开发机；如果希望更安全，可以设置口令并配合 ssh-agent 使用（见第 4 节）。旧密钥可以保留，也可以在 GitHub 上删除对应公钥。
 
 ### 8.2 `Host key verification failed`
 
@@ -240,6 +271,7 @@ git push -u origin main
 
 ```bash
 git remote -v
+git status -sb          # 应显示 ## main...origin/main
 git log --oneline -3
 git ls-remote --heads origin
 ```
