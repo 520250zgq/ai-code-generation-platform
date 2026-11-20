@@ -521,6 +521,7 @@ import { useLoginUserStore } from '@/stores/loginUser'
 import { getAppPreviewUrl, getErrorMessage, isSameId, toSafeHttpUrl } from '@/utils/app'
 import { downloadAppCode } from '@/utils/appDownload'
 import { generateAppCode } from '@/utils/appStream'
+import { buildPreviewUrl, getPreviewStatus, waitForPreview, type PreviewStatus } from '@/utils/preview'
 import {
   clearVisualEditorSelection,
   composePromptWithElement,
@@ -577,6 +578,7 @@ let pageVersion = 0
 let nextMessageId = 0
 let streamController: AbortController | undefined
 let probeController: AbortController | undefined
+let previewController: AbortController | undefined
 let stopVisualEditor: (() => void) | undefined
 let activeResponse: ChatMessage | undefined
 let stickToBottom = true
@@ -592,8 +594,10 @@ function getRouteId() {
 function cancelPendingRequests() {
   streamController?.abort()
   probeController?.abort()
+  previewController?.abort()
   streamController = undefined
   probeController = undefined
+  previewController = undefined
   activeResponse = undefined
 }
 
@@ -678,17 +682,52 @@ async function loadApp() {
   }
 }
 
-/** 通过 HEAD 请求探测生成目录是否已有可预览的 index.html。 */
+/**
+ * 回显已有预览。
+ *
+ * 优先查询服务端的预览状态：它能区分“还没有产物”“Vue 正在构建”“已就绪”，
+ * 因此不会在构建期间把旧版本当成最新效果展示。状态接口不可用时回退到 HEAD 探测。
+ */
 async function probeExistingPreview() {
   if (!app.value || generating.value || probingPreview.value || attemptedGeneration.value) return
   const url = getAppPreviewUrl(app.value)
   if (!url) return
   const version = pageVersion
+  probingPreview.value = true
+  previewCheckError.value = false
+  try {
+    const status = await getPreviewStatus(app.value.id as number)
+    if (version !== pageVersion || generating.value) return
+    if (status && status.state !== 'MISSING') {
+      if (status.ready && setPreviewFromStatus(status)) return
+      // Vue 工程正在构建：先展示构建提示页，构建完成后自动刷新到最新版本。
+      if (!previewUrl.value) setPreview()
+      if (status.state === 'BUILDING') {
+        previewController?.abort()
+        const controller = new AbortController()
+        previewController = controller
+        void waitForPreview(app.value.id as number, {
+          previousRevision: status.revision,
+          signal: controller.signal,
+          onStatus: (latest) => {
+            if (version !== pageVersion) return
+            if (latest.ready) setPreviewFromStatus(latest)
+          },
+        })
+      }
+      return
+    }
+    await probeExistingPreviewByHead(url, version)
+  } finally {
+    if (version === pageVersion) probingPreview.value = false
+  }
+}
+
+/** 通过 HEAD 请求探测生成目录是否已有可预览的 index.html（状态接口不可用时的兜底）。 */
+async function probeExistingPreviewByHead(url: string, version: number) {
   probeController?.abort()
   const controller = new AbortController()
   probeController = controller
-  probingPreview.value = true
-  previewCheckError.value = false
   const timeout = window.setTimeout(() => controller.abort(), 10000)
   try {
     const response = await fetch(url, {
@@ -710,7 +749,6 @@ async function probeExistingPreview() {
   } finally {
     window.clearTimeout(timeout)
     if (version === pageVersion && probeController === controller) {
-      probingPreview.value = false
       probeController = undefined
     }
   }
@@ -727,6 +765,50 @@ function setPreview() {
   previewLoading.value = true
   // 页面已经刷新，之前选中的元素可能不再存在，避免把过期信息带进下一轮提示词。
   selectedElement.value = undefined
+}
+
+/**
+ * 用后端返回的预览状态刷新 iframe。
+ *
+ * 版本号来自服务端，构建完成时会递增，因此这里一定加载到最新产物；
+ * 没有产物时返回 false，交由调用方决定是否回退到旧的探测逻辑。
+ */
+function setPreviewFromStatus(status?: PreviewStatus): boolean {
+  const url = buildPreviewUrl(status)
+  if (!url) return false
+  previewUrl.value = url
+  previewLoading.value = true
+  previewCheckError.value = false
+  selectedElement.value = undefined
+  return true
+}
+
+/**
+ * 生成完成后同步预览：先取一次状态，就绪则立即刷新；Vue 工程则继续轮询构建结果。
+ *
+ * 轮询使用独立的 AbortController，页面切换或用户再次生成时会被中止，避免旧请求覆盖新状态。
+ */
+async function syncPreviewAfterGeneration(version: number) {
+  const id = app.value?.id
+  if (!id) return
+  // 每次同步都换一个控制器，页面切换或再次生成时旧轮询会被中止。
+  previewController?.abort()
+  const controller = new AbortController()
+  previewController = controller
+  const initial = await getPreviewStatus(id, controller.signal)
+  if (version !== pageVersion || controller.signal.aborted) return
+  if (initial?.ready && setPreviewFromStatus(initial)) return
+  // 还没构建好：先展示构建提示页（旧版行为），同时后台等待最新版本，就绪后自动刷新。
+  if (!previewUrl.value) setPreview()
+  void waitForPreview(id, {
+    previousRevision: initial?.revision,
+    signal: controller.signal,
+    onStatus: (status) => {
+      if (version !== pageVersion) return
+      if (status.ready) setPreviewFromStatus(status)
+      else if (status.state === 'FAILED') message.warning(status.message || '最新版本构建失败')
+    },
+  })
 }
 
 /** 在非生成状态下重新加载预览，避免覆盖正在写入的生成结果。 */
@@ -964,7 +1046,8 @@ async function sendMessage(value?: string) {
     if (version !== pageVersion || streamController !== controller || controller.signal.aborted)
       return
     response.status = 'complete'
-    setPreview()
+    // 预览同步放在后台执行：Vue 工程可能还要构建几十秒，不能拖住本轮对话的结束状态。
+    void syncPreviewAfterGeneration(version)
     void scrollMessages()
   } catch (error) {
     if (version !== pageVersion || streamController !== controller) return

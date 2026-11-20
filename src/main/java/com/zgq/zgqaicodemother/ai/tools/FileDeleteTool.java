@@ -67,6 +67,11 @@ public class FileDeleteTool extends AbstractFileTool {
         if (Files.isDirectory(target)) {
             return failure(normalizedPath + "，该路径是目录，本工具只能删除单个文件");
         }
+        // 删除本来就是幂等的，再叠加循环保护，避免模型把“删了又建、建了又删”当成修复手段。
+        ToolCallDecision decision = checkToolCall(appId, TOOL_NAME, normalizedPath);
+        if (!decision.allowed()) {
+            return failure(decision.hint());
+        }
         try {
             if (!Files.deleteIfExists(target)) {
                 // 文件已经不存在时视为目标状态已达成，避免模型反复尝试删除同一个文件。

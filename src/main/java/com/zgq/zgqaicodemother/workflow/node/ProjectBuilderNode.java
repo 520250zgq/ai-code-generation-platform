@@ -5,6 +5,7 @@ import com.zgq.zgqaicodemother.constant.AppConstant;
 import com.zgq.zgqaicodemother.core.builder.VueProjectBuilder;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import com.zgq.zgqaicodemother.workflow.WorkflowNodes;
+import com.zgq.zgqaicodemother.workflow.config.WorkflowProperties;
 import com.zgq.zgqaicodemother.workflow.state.WorkflowContext;
 import com.zgq.zgqaicodemother.workflow.state.WorkflowState;
 import lombok.extern.slf4j.Slf4j;
@@ -24,8 +25,12 @@ import static org.bsc.langgraph4j.action.AsyncNodeAction.node_async;
  * <p>HTML / 多文件模式生成的是可直接浏览的静态文件，不需要构建；Vue 工程需要执行
  * {@code npm install} 和 {@code npm run build}，构建成功后才得到可预览的 dist 目录。</p>
  *
- * <p>构建耗时较长，工作流服务会把整个图放在虚拟线程中执行，不会占用 Web 请求线程。
- * 构建失败只写入上下文错误，不抛出异常，保证调用方仍能拿到源码目录和失败原因。</p>
+ * <p>构建失败等价于“代码无法正常打包”。如果质检功能开启且还有修复额度，节点只记录
+ * {@code buildFailureMessage} 并占用一次修复额度，由工作流的条件边返回代码生成节点修复；
+ * 额度用尽或质检关闭时才写入阻断性错误。构建失败本身不抛异常，保证调用方仍能拿到源码目录
+ * 和失败原因。</p>
+ *
+ * <p>构建耗时较长，工作流服务会把整个图放在虚拟线程中执行，不会占用 Web 请求线程。</p>
  */
 @Slf4j
 @Component
@@ -33,8 +38,11 @@ public class ProjectBuilderNode {
 
     private final VueProjectBuilder vueProjectBuilder;
 
-    public ProjectBuilderNode(VueProjectBuilder vueProjectBuilder) {
+    private final WorkflowProperties properties;
+
+    public ProjectBuilderNode(VueProjectBuilder vueProjectBuilder, WorkflowProperties properties) {
         this.vueProjectBuilder = vueProjectBuilder;
+        this.properties = properties;
     }
 
     /**
@@ -67,13 +75,13 @@ public class ProjectBuilderNode {
         if (type != CodeGenTypeEnum.VUE_PROJECT) {
             context.setBuildResultDir(codeDir.toString());
             context.setBuildSuccess(true);
+            context.clearBuildFailure();
             context.setCurrentStep("项目构建完成（静态文件无需构建）");
             log.info("静态网站无需构建，workflowId={}，dir={}", context.getWorkflowId(), codeDir);
             return WorkflowState.save(context);
         }
         if (!Files.isRegularFile(codeDir.resolve("package.json"))) {
-            context.fail("项目构建失败", "Vue 工程缺少 package.json");
-            return WorkflowState.save(context);
+            return recordBuildFailure(context, codeDir, "Vue 工程缺少 package.json，无法安装依赖和打包");
         }
         context.setCurrentStep("Vue 工程构建中");
         long startNanos = System.nanoTime();
@@ -81,23 +89,47 @@ public class ProjectBuilderNode {
             boolean success = vueProjectBuilder.buildProject(codeDir.toString());
             Path distDir = codeDir.resolve("dist").normalize();
             if (!success || !Files.isDirectory(distDir)) {
-                context.setBuildSuccess(false);
-                context.setBuildResultDir(codeDir.toString());
-                context.fail("项目构建失败", "Vue 工程构建失败，请查看服务端构建日志");
-                log.error("Vue 工程构建失败，workflowId={}，dir={}", context.getWorkflowId(), codeDir);
-                return WorkflowState.save(context);
+                return recordBuildFailure(context, codeDir,
+                        "Vue 工程构建失败：npm install 或 npm run build 未通过，请检查依赖、导入路径和语法错误");
             }
             context.setBuildSuccess(true);
             context.setBuildResultDir(distDir.toString());
+            context.clearBuildFailure();
             context.setCurrentStep("Vue 工程构建完成");
             log.info("Vue 工程构建节点完成，workflowId={}，耗时={}ms，dist={}",
                     context.getWorkflowId(), (System.nanoTime() - startNanos) / 1_000_000, distDir);
         } catch (Exception e) {
-            context.setBuildSuccess(false);
-            context.setBuildResultDir(codeDir.toString());
-            context.fail("项目构建失败", "Vue 工程构建异常，请查看服务端构建日志");
             log.error("Vue 工程构建节点异常，workflowId={}，dir={}",
                     context.getWorkflowId(), codeDir, e);
+            return recordBuildFailure(context, codeDir,
+                    "Vue 工程构建异常，请检查 package.json 和工程文件是否完整");
+        }
+        return WorkflowState.save(context);
+    }
+
+    /**
+     * 记录构建失败。
+     *
+     * <p>还有修复额度时不写阻断性错误，让条件边把流程送回代码生成节点；额度用尽后写入错误，
+     * 工作流在 END 正常结束并返回可读的失败原因。</p>
+     */
+    private Map<String, Object> recordBuildFailure(WorkflowContext context, Path codeDir, String message) {
+        context.setBuildSuccess(false);
+        context.setBuildResultDir(codeDir.toString());
+        context.markBuildFailure(message);
+        WorkflowProperties.QualityCheck qualityCheck = properties.getQualityCheck();
+        int maxRepairAttempts = Math.max(0, qualityCheck.getMaxRepairAttempts());
+        if (qualityCheck.isEnabled() && context.canRepair(maxRepairAttempts)) {
+            context.recordRepairAttempt();
+            context.setCurrentStep("Vue 工程构建失败，准备进入质检修复（第 "
+                    + context.getRepairAttempts() + "/" + maxRepairAttempts + " 次）");
+            log.warn("Vue 工程构建失败，准备返回代码生成节点修复，workflowId={}，attempt={}/{}, dir={}",
+                    context.getWorkflowId(), context.getRepairAttempts(), maxRepairAttempts, codeDir);
+        } else {
+            context.fail("项目构建失败", message);
+            context.setCurrentStep("Vue 工程构建失败");
+            log.error("Vue 工程构建失败且没有剩余修复额度，workflowId={}，dir={}",
+                    context.getWorkflowId(), codeDir);
         }
         return WorkflowState.save(context);
     }

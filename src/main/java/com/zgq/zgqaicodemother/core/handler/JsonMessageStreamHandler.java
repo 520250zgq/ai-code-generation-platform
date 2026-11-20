@@ -2,10 +2,12 @@ package com.zgq.zgqaicodemother.core.handler;
 
 import cn.hutool.core.util.StrUtil;
 import com.zgq.zgqaicodemother.ai.tools.FileWriteTool;
+import com.zgq.zgqaicodemother.ai.tools.ToolCallGuard;
 import com.zgq.zgqaicodemother.ai.tools.ToolManager;
 import com.zgq.zgqaicodemother.core.builder.VueProjectBuilder;
 import com.zgq.zgqaicodemother.exception.BusinessException;
 import com.zgq.zgqaicodemother.exception.ErrorCode;
+import com.zgq.zgqaicodemother.preview.PreviewService;
 import dev.langchain4j.service.TokenStream;
 import dev.langchain4j.service.tool.ToolExecution;
 import lombok.extern.slf4j.Slf4j;
@@ -24,7 +26,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>当流式输出正常完成时，Vue 工程源码已经全部落盘。此时触发 {@link VueProjectBuilder}
  * 在虚拟线程中异步执行 npm 安装和打包，既能让用户立即看到生成完成，又不会阻塞主流程。
- * 构建失败只记录日志，不会把异常抛回 SSE 流。</p>
+ * 构建开始/结束时同步更新预览状态，前端据此在构建完成后自动刷新到最新版本。</p>
+ *
+ * <p>工具调用有两层保护：本类保留“单轮硬上限”，超过后直接终止流；
+ * {@link ToolCallGuard} 负责语义层面的重复调用拦截。两层互补：前者防住任何形式的暴走，
+ * 后者在触顶之前就让模型自我纠正，避免用户白等几分钟才收到失败提示。</p>
  */
 @Slf4j
 @Component
@@ -43,9 +49,14 @@ public class JsonMessageStreamHandler {
 
     private final ToolManager toolManager;
 
-    public JsonMessageStreamHandler(VueProjectBuilder vueProjectBuilder, ToolManager toolManager) {
+    private final PreviewService previewService;
+
+    public JsonMessageStreamHandler(VueProjectBuilder vueProjectBuilder,
+                                    ToolManager toolManager,
+                                    PreviewService previewService) {
         this.vueProjectBuilder = vueProjectBuilder;
         this.toolManager = toolManager;
+        this.previewService = previewService;
     }
 
     /**
@@ -126,13 +137,26 @@ public class JsonMessageStreamHandler {
                             }
                         }
                     })
-                    .onError(sink::error)
+                    // 工具循环熔断属于可读的业务结果，包成 BusinessException 让 SSE 直接展示原因，
+                    // 而不是被统一改写成“AI 生成中断”。
+                    .onError(error -> sink.error(toReadableError(error, appId)))
                     .start();
         });
     }
 
     /**
-     * 触发 Vue 工程的异步构建。
+     * 把工具层的熔断异常转换为面向用户的业务异常；其他异常原样透传。
+     */
+    private static Throwable toReadableError(Throwable error, Long appId) {
+        if (error instanceof ToolCallGuard.ToolCallLimitException limitException) {
+            log.warn("工具调用循环保护已终止生成，appId={}，原因={}", appId, limitException.getMessage());
+            return new BusinessException(ErrorCode.OPERATION_ERROR, limitException.getMessage());
+        }
+        return error;
+    }
+
+    /**
+     * 触发 Vue 工程的异步构建，并在构建结束时更新预览状态。
      *
      * <p>构建器内部已经捕获异常，这里再包一层，确保任何构建相关问题都不会影响主流程。</p>
      *
@@ -142,9 +166,14 @@ public class JsonMessageStreamHandler {
         try {
             String projectPath = FileWriteTool.projectRoot(appId).toString();
             log.info("Vue 工程流式输出完成，提交异步构建任务，appId={}，工程目录={}", appId, projectPath);
-            vueProjectBuilder.buildProjectAsync(projectPath);
+            // 先标记 BUILDING，前端在构建期间不会把旧 dist 当成最新效果。
+            previewService.markBuildStarted(appId);
+            vueProjectBuilder.buildProjectAsync(projectPath,
+                    success -> previewService.markBuildFinished(appId, success));
         } catch (Exception e) {
             log.error("提交 Vue 项目构建任务失败，appId={}", appId, e);
+            // 构建任务都没提交成功，不能一直停留在 BUILDING。
+            previewService.markBuildFinished(appId, false);
         }
     }
 

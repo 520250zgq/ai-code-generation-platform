@@ -12,7 +12,13 @@ import com.zgq.zgqaicodemother.model.dto.app.AppQueryRequest;
 import com.zgq.zgqaicodemother.model.dto.app.AppUpdateRequest;
 import com.zgq.zgqaicodemother.model.entity.App;
 import com.zgq.zgqaicodemother.model.entity.User;
+import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import com.zgq.zgqaicodemother.model.vo.AppVO;
+import com.zgq.zgqaicodemother.preview.PreviewService;
+import com.zgq.zgqaicodemother.preview.PreviewState;
+import com.zgq.zgqaicodemother.preview.PreviewStatus;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewProperties;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewService;
 import com.zgq.zgqaicodemother.service.AppService;
 import com.zgq.zgqaicodemother.service.UserService;
 import org.junit.jupiter.api.AfterEach;
@@ -66,6 +72,9 @@ class AppControllerTest {
     @Mock
     private UserService userService;
 
+    @Mock
+    private PreviewService previewService;
+
     @InjectMocks
     private AppController controller;
 
@@ -77,6 +86,9 @@ class AppControllerTest {
         loginUser = new User();
         loginUser.setId(OWNER_ID);
         loginUser.setUserRole(UserConstant.DEFAULT_ROLE);
+        // 审查器使用真实实现：入口安全检查是本次优化的核心行为之一，mock 掉就覆盖不到了。
+        ReflectionTestUtils.setField(controller, "promptReviewService",
+                new PromptReviewService(new PromptReviewProperties()));
         // Some invalid requests are rejected before login lookup, others after it.
         lenient().when(userService.getLoginUser(request)).thenReturn(loginUser);
     }
@@ -282,8 +294,10 @@ class AppControllerTest {
         AppQueryRequest input = maliciousQuery();
         Page<App> records = Page.of(2, 20);
         Page<AppVO> views = Page.of(2, 20);
-        when(appService.listAppByPage(any(AppQueryRequest.class))).thenReturn(records);
-        when(appService.getAppVOPage(records)).thenReturn(views);
+        // 两个列表入口共用同一组断言，按参数只走其中一条路径，故用 lenient 声明两条链路的桩。
+        lenient().when(appService.listAppByPage(any(AppQueryRequest.class))).thenReturn(records);
+        lenient().when(appService.getAppVOPage(records)).thenReturn(views);
+        lenient().when(appService.listGoodAppVOPage(any(AppQueryRequest.class))).thenReturn(views);
 
         Page<AppVO> actual = good
                 ? controller.listGoodAppVOByPage(input, request).getData()
@@ -291,7 +305,12 @@ class AppControllerTest {
 
         assertSame(views, actual);
         ArgumentCaptor<AppQueryRequest> captured = ArgumentCaptor.forClass(AppQueryRequest.class);
-        verify(appService).listAppByPage(captured.capture());
+        if (good) {
+            // 精选列表走带缓存的入口，查询条件仍必须只保留普通用户可用字段。
+            verify(appService).listGoodAppVOPage(captured.capture());
+        } else {
+            verify(appService).listAppByPage(captured.capture());
+        }
         AppQueryRequest safe = captured.getValue();
         assertNotSame(input, safe);
         assertEquals(2, safe.getPageNum());
@@ -374,6 +393,46 @@ class AppControllerTest {
         assertError(ErrorCode.PARAMS_ERROR, () -> controller.adminUpdateApp(input));
 
         verify(appService, never()).updateById(any(App.class));
+    }
+
+    @Test
+    void previewStatusReturnsLatestSnapshotForExistingApp() {
+        App existing = appOwnedBy(OWNER_ID);
+        existing.setCodeGenType("vue_project");
+        when(appService.getById(APP_ID)).thenReturn(existing);
+        PreviewStatus snapshot = new PreviewStatus(APP_ID, "vue_project", PreviewState.BUILDING,
+                3L, false, "static/vue_project_" + APP_ID + "/", "正在构建", 1_700_000_000_000L);
+        when(previewService.snapshot(APP_ID, CodeGenTypeEnum.VUE_PROJECT)).thenReturn(snapshot);
+
+        assertSame(snapshot, controller.getPreviewStatus(APP_ID, request).getData());
+
+        verify(userService).getLoginUser(request);
+    }
+
+    @Test
+    void previewStatusRejectsMissingApp() {
+        assertError(ErrorCode.NOT_FOUND_ERROR, () -> controller.getPreviewStatus(APP_ID, request));
+
+        verifyNoInteractions(previewService);
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(longs = {0, -1})
+    void previewStatusRejectsInvalidIds(Long id) {
+        assertError(ErrorCode.PARAMS_ERROR, () -> controller.getPreviewStatus(id, request));
+
+        verifyNoInteractions(appService, previewService);
+    }
+
+    @Test
+    void previewStatusRequiresLogin() {
+        when(userService.getLoginUser(request))
+                .thenThrow(new BusinessException(ErrorCode.NOT_LOGIN_ERROR));
+
+        assertError(ErrorCode.NOT_LOGIN_ERROR, () -> controller.getPreviewStatus(APP_ID, request));
+
+        verifyNoInteractions(previewService);
     }
 
     private AppController protectedController() {

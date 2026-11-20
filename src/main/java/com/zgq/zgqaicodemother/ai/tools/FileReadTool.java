@@ -76,6 +76,11 @@ public class FileReadTool extends AbstractFileTool {
         if (!Files.isRegularFile(target)) {
             return failure(normalizedPath + "，文件不存在，请先使用 readDir 查看目录结构");
         }
+        // 反复读取同一个文件通常说明模型丢失了上下文，先提示它直接复用已有内容。
+        ToolCallDecision decision = checkToolCall(appId, TOOL_NAME, normalizedPath);
+        if (!decision.allowed()) {
+            return failure(decision.hint());
+        }
         try {
             String content = Files.readString(target, StandardCharsets.UTF_8);
             int contentLength = content.length();

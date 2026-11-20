@@ -11,12 +11,16 @@ import com.zgq.zgqaicodemother.manager.CosManager;
 import com.zgq.zgqaicodemother.model.entity.App;
 import com.zgq.zgqaicodemother.model.entity.User;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
+import com.zgq.zgqaicodemother.preview.PreviewService;
 import com.zgq.zgqaicodemother.service.AppService;
 import com.zgq.zgqaicodemother.workflow.CodeGenWorkflow;
+import com.zgq.zgqaicodemother.workflow.ai.CodeQualityCheckService;
 import com.zgq.zgqaicodemother.workflow.config.WorkflowProperties;
 import com.zgq.zgqaicodemother.workflow.model.ImageCollectionPlan;
+import com.zgq.zgqaicodemother.workflow.model.QualityCheckReview;
 import com.zgq.zgqaicodemother.workflow.model.WorkflowEvent;
 import com.zgq.zgqaicodemother.workflow.model.WorkflowResult;
+import com.zgq.zgqaicodemother.workflow.node.CodeQualityCheckNode;
 import com.zgq.zgqaicodemother.workflow.node.HtmlCodeGeneratorNode;
 import com.zgq.zgqaicodemother.workflow.node.ImageCollectorNode;
 import com.zgq.zgqaicodemother.workflow.node.MultiFileCodeGeneratorNode;
@@ -25,6 +29,7 @@ import com.zgq.zgqaicodemother.workflow.node.PromptEnhancerNode;
 import com.zgq.zgqaicodemother.workflow.node.RouterNode;
 import com.zgq.zgqaicodemother.workflow.node.VueCodeGeneratorNode;
 import com.zgq.zgqaicodemother.workflow.state.WorkflowContext;
+import com.zgq.zgqaicodemother.workflow.tools.CodeBundleTool;
 import com.zgq.zgqaicodemother.workflow.tools.ContentImageSearchTool;
 import com.zgq.zgqaicodemother.workflow.tools.LogoGeneratorTool;
 import com.zgq.zgqaicodemother.workflow.tools.MermaidDiagramTool;
@@ -277,7 +282,7 @@ class WorkflowServiceImplTest {
 
     private WorkflowServiceImpl service(CodeGenWorkflow workflow) {
         return new WorkflowServiceImpl(workflow, appService, properties,
-                contentTool, undrawTool, mermaidTool, logoTool, cosManager);
+                contentTool, undrawTool, mermaidTool, logoTool, cosManager, mock(PreviewService.class));
     }
 
     private CodeGenWorkflow realWorkflow(long appId, CodeGenTypeEnum type) {
@@ -294,9 +299,18 @@ class WorkflowServiceImplTest {
                     Path dir = Path.of(AppConstant.CODE_OUTPUT_ROOT_DIR,
                             actualType.getValue() + "_" + appId).toAbsolutePath().normalize();
                     Files.createDirectories(dir);
-                    Files.writeString(dir.resolve("index.html"), "<html></html>");
+                    Files.writeString(dir.resolve("index.html"),
+                            "<html><body><h1>ok</h1></body></html>");
+                    if (actualType == CodeGenTypeEnum.MULTI_FILE) {
+                        Files.writeString(dir.resolve("style.css"), "body{}");
+                        Files.writeString(dir.resolve("script.js"), "console.log(1);");
+                    }
                     if (actualType == CodeGenTypeEnum.VUE_PROJECT) {
-                        Files.writeString(dir.resolve("package.json"), "{}");
+                        Files.writeString(dir.resolve("package.json"),
+                                "{\"scripts\":{\"build\":\"vite build\"},\"dependencies\":{\"vue\":\"^3.3.4\"}}");
+                        Files.createDirectories(dir.resolve("src"));
+                        Files.writeString(dir.resolve("src/main.js"), "import App from './App.vue'");
+                        Files.writeString(dir.resolve("src/App.vue"), "<template><div/></template>");
                     }
                     createdDirs.add(dir);
                     return Flux.just("ok");
@@ -309,14 +323,22 @@ class WorkflowServiceImplTest {
             return true;
         });
         WorkflowProperties workflowProperties = new WorkflowProperties();
+        CodeQualityCheckService qualityCheckService = mock(CodeQualityCheckService.class);
+        when(qualityCheckService.reviewCode(anyString())).thenReturn(QualityCheckReview.builder()
+                .valid(true)
+                .errors(List.of())
+                .suggestions(List.of())
+                .build());
+        CodeBundleTool codeBundleTool = new CodeBundleTool();
         return new CodeGenWorkflow(
                 new ImageCollectorNode(collectionService),
                 new PromptEnhancerNode(),
                 new RouterNode(routingService),
-                new HtmlCodeGeneratorNode(facade, workflowProperties),
-                new MultiFileCodeGeneratorNode(facade, workflowProperties),
-                new VueCodeGeneratorNode(facade, workflowProperties),
-                new ProjectBuilderNode(builder));
+                new HtmlCodeGeneratorNode(facade, workflowProperties, codeBundleTool),
+                new MultiFileCodeGeneratorNode(facade, workflowProperties, codeBundleTool),
+                new VueCodeGeneratorNode(facade, workflowProperties, codeBundleTool),
+                new CodeQualityCheckNode(codeBundleTool, qualityCheckService, workflowProperties),
+                new ProjectBuilderNode(builder, workflowProperties));
     }
 
     private static App app(long id, long userId, String prompt) {

@@ -22,10 +22,15 @@ public final class WorkflowNodes {
 
     public static final String VUE_CODE_GENERATOR = "vue_code_generator";
 
+    public static final String CODE_QUALITY_CHECK = "code_quality_check";
+
     public static final String PROJECT_BUILDER = "project_builder";
 
     /**
      * 按工作流执行顺序排列的节点，供进度展示和文档生成使用。
+     *
+     * <p>质检节点位于代码生成之后、项目构建之前：静态站点在这里完成 AI 复核，
+     * 不通过时通过条件边回到对应的生成节点；Vue 工程还需要在质检通过后执行构建。</p>
      */
     public static final List<String> ORDERED_NODES = List.of(
             IMAGE_COLLECTOR,
@@ -34,6 +39,7 @@ public final class WorkflowNodes {
             HTML_CODE_GENERATOR,
             MULTI_FILE_CODE_GENERATOR,
             VUE_CODE_GENERATOR,
+            CODE_QUALITY_CHECK,
             PROJECT_BUILDER);
 
     private WorkflowNodes() {
@@ -56,6 +62,7 @@ public final class WorkflowNodes {
             case HTML_CODE_GENERATOR -> "生成 HTML 网站";
             case MULTI_FILE_CODE_GENERATOR -> "生成多文件网站";
             case VUE_CODE_GENERATOR -> "生成 Vue 工程";
+            case CODE_QUALITY_CHECK -> "代码质检";
             case PROJECT_BUILDER -> "项目构建";
             default -> node;
         };

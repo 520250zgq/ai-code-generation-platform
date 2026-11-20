@@ -32,6 +32,14 @@ public class ChatMemoryProperties {
     private int maxCachedConversations = 100;
 
     /**
+     * 同一应用并发首访时，等待其他线程完成记忆初始化的最长时间。
+     *
+     * <p>初始化只包含一次 Redis 读取和最多一次 MySQL 查询，超过该时长通常说明下游已经故障；
+     * 此时返回“上下文加载超时”，避免请求线程无限堆积。</p>
+     */
+    private Duration loadTimeout = Duration.ofSeconds(10);
+
+    /**
      * Redis key 前缀，按应用维度追加 appId。
      */
     private String keyPrefix = "zgq:ai-code-mother:chat-memory:";

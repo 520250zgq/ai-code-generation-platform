@@ -3,6 +3,7 @@ package com.zgq.zgqaicodemother.workflow.state;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import com.zgq.zgqaicodemother.workflow.model.ImageCollectionPlan;
 import com.zgq.zgqaicodemother.workflow.model.ImageResource;
+import com.zgq.zgqaicodemother.workflow.model.QualityCheckResult;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -89,6 +90,22 @@ public class WorkflowContext implements Serializable {
     private String buildResultDir;
 
     /**
+     * 最近一次代码质检结果。条件边据此决定“继续构建 / 返回生成节点修复 / 终止”。
+     */
+    private QualityCheckResult qualityCheckResult;
+
+    /**
+     * 本轮工作流已经执行的修复次数（质检不通过或构建失败都会消耗一次额度）。
+     */
+    @Builder.Default
+    private int repairAttempts = 0;
+
+    /**
+     * 最近一次构建失败的原因，仅在允许继续修复时写入；修复提示词会把它拼进错误列表。
+     */
+    private String buildFailureMessage;
+
+    /**
      * 构建是否成功。HTML / 多文件模式不需要构建，视为成功。
      */
     @Builder.Default
@@ -165,6 +182,57 @@ public class WorkflowContext implements Serializable {
     }
 
     /**
+     * 质检是否已经通过。
+     *
+     * @return 存在结果且判定通过时返回 true
+     */
+    public boolean qualityCheckPassed() {
+        return qualityCheckResult != null && qualityCheckResult.passed();
+    }
+
+    /**
+     * 是否存在未解决的质检问题。
+     *
+     * @return 存在结果且判定未通过时返回 true
+     */
+    public boolean hasQualityIssues() {
+        return qualityCheckResult != null && !qualityCheckResult.passed();
+    }
+
+    /**
+     * 是否还有修复额度。
+     *
+     * @param maxRepairAttempts 允许的最大修复次数
+     * @return 可以继续修复时返回 true
+     */
+    public boolean canRepair(int maxRepairAttempts) {
+        return repairAttempts < Math.max(0, maxRepairAttempts);
+    }
+
+    /**
+     * 记录一次修复，占用一次修复额度。
+     */
+    public void recordRepairAttempt() {
+        this.repairAttempts++;
+    }
+
+    /**
+     * 记录构建失败原因。只保留可读文本，避免把整段 npm 日志塞进状态。
+     *
+     * @param message 失败原因
+     */
+    public void markBuildFailure(String message) {
+        this.buildFailureMessage = trimToLength(message, MAX_BUILD_FAILURE_LENGTH);
+    }
+
+    /**
+     * 清除构建失败标记，用于构建成功或开始新一轮修复时。
+     */
+    public void clearBuildFailure() {
+        this.buildFailureMessage = null;
+    }
+
+    /**
      * 计算当前工作流耗时，结束时间未设置时按当前时间计算。
      *
      * @return 毫秒数，开始时间为空时返回 0
@@ -189,6 +257,8 @@ public class WorkflowContext implements Serializable {
     private static final int MAX_WARNING_LENGTH = 500;
 
     private static final int MAX_ERROR_LENGTH = 2000;
+
+    private static final int MAX_BUILD_FAILURE_LENGTH = 1200;
 
     private static String trimToLength(String value, int maxLength) {
         if (value == null) {

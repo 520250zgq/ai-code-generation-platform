@@ -113,6 +113,28 @@ npm run type-check
 npm run build
 ```
 
+## 系统级优化测试（并发 / 缓存 / 限流 / 审查 / 护轨 / 预览）
+
+```powershell
+mvn '-Dtest=AiConcurrencyLimiterTest,KeyedLockTest,ConversationMemoryCacheConcurrencyTest,GoodAppListCacheTest,RateLimiterTest,RateLimitAspectTest,ClientIpResolverTest,PromptReviewServiceTest,AiRetryGuardTest,CodeOutputGuardTest,ToolCallGuardTest,ToolLoopProtectionTest,PreviewServiceTest,AppServiceImplOptimizationTest,GlobalExceptionHandlerTest' test
+```
+
+- `AiConcurrencyLimiterTest` 验证全局并发上限、同一应用互斥、许可超时、租约幂等关闭、排队请求被唤醒，以及关闭开关后仍保留应用级互斥。
+- `KeyedLockTest` 验证同 key 互斥、不同 key 并行、引用计数归零后清理，以及未持锁释放立即失败。
+- `ConversationMemoryCacheConcurrencyTest` 用“加载一个应用时阻塞”的方式锁定优化目标：另一个应用的获取不被阻塞，同一应用并发首访只回源一次，加载失败后不泄漏加载锁。
+- `GoodAppListCacheTest` 验证命中/未命中、版本号失效、Redis 异常静默降级、脏数据删除、不可缓存请求零 Redis 访问、500KB 上限和分页字段重组。
+- `RateLimiterTest` / `RateLimitAspectTest` / `ClientIpResolverTest` 验证 Redis 固定窗口、本地兜底与 fail-open 语义、窗口恢复、重复注解、用户/IP 维度组合和转发头清洗。
+- `PromptReviewServiceTest` 覆盖 4 类必拦截、5 条必放行（含 `<script>`、`localStorage`、“忽略页面空白”）、零宽字符清洗、分隔符中和、超长输入、自定义黑名单和场景阈值差异。
+- `AiRetryGuardTest` 验证“未输出内容才重试”“业务错误不重试”“退避耗尽抛出原始异常”。
+- `CodeOutputGuardTest` 验证截断 HTML、空输出和服务器路径泄漏都会被拒绝保存。
+- `ToolCallGuardTest` / `ToolLoopProtectionTest` 验证单轮预算、重复提示、升级熔断、并发下不超预算、内容一致时幂等跳过，以及所有文件工具共享同一份预算。
+- `PreviewServiceTest` 验证静态模式立即 READY、Vue 构建中/失败/就绪状态流转、版本号递增、文件缺失降级和 Redis 不可用时的本地状态。
+- `AppServiceImplOptimizationTest` 验证精选列表命中不查库、未命中回填、删除应用同时清理缓存/记忆/预览，以及同一应用并发生成被拒绝、流异常后许可归还。
+- `GlobalExceptionHandlerTest` 验证限流异常返回 HTTP 429 + `Retry-After`，以及非法 JSON 按参数错误返回。
+
+以上测试都不需要 Redis、MySQL 或真实模型。设计说明与上线检查清单见
+[system-optimization.md](./system-optimization.md)。
+
 ## 网页截图与对象存储测试
 
 ```powershell

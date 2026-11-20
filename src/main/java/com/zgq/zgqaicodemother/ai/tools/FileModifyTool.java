@@ -97,6 +97,11 @@ public class FileModifyTool extends AbstractFileTool {
         if (!Files.isRegularFile(target)) {
             return failure(normalizedPath + "，文件不存在，请先使用 readFile 或 writeFile 创建");
         }
+        // 同一处修改被反复提交时，先提示模型读取最新内容再决定，避免“改不动就一直改”。
+        ToolCallDecision decision = checkToolCall(appId, TOOL_NAME, normalizedPath);
+        if (!decision.allowed()) {
+            return failure(decision.hint());
+        }
         try {
             String fileContent = Files.readString(target, StandardCharsets.UTF_8);
             int firstIndex = fileContent.indexOf(oldContent);

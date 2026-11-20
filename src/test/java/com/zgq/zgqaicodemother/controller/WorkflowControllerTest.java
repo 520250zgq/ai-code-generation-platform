@@ -5,18 +5,22 @@ import com.zgq.zgqaicodemother.common.BaseResponse;
 import com.zgq.zgqaicodemother.exception.BusinessException;
 import com.zgq.zgqaicodemother.exception.ErrorCode;
 import com.zgq.zgqaicodemother.model.entity.User;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewProperties;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewService;
 import com.zgq.zgqaicodemother.service.UserService;
 import com.zgq.zgqaicodemother.workflow.model.WorkflowEvent;
 import com.zgq.zgqaicodemother.workflow.model.WorkflowResult;
 import com.zgq.zgqaicodemother.workflow.model.dto.WorkflowExecuteRequest;
 import com.zgq.zgqaicodemother.workflow.service.WorkflowService;
 import jakarta.servlet.http.HttpServletRequest;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.codec.ServerSentEvent;
+import org.springframework.test.util.ReflectionTestUtils;
 import reactor.core.publisher.Flux;
 
 import java.util.List;
@@ -49,6 +53,15 @@ class WorkflowControllerTest {
     private WorkflowController controller;
 
     private final User loginUser = loginUser();
+
+    /**
+     * 使用真实审查器，保证正常需求不会被入口安全检查误拦。
+     */
+    @BeforeEach
+    void setUpPromptReview() {
+        ReflectionTestUtils.setField(controller, "promptReviewService",
+                new PromptReviewService(new PromptReviewProperties()));
+    }
 
     @Test
     void syncExecuteReturnsWorkflowResult() {
@@ -125,7 +138,7 @@ class WorkflowControllerTest {
     private static WorkflowResult result(boolean success) {
         return new WorkflowResult("wf-1", 1L, success, "完成", "html",
                 "html_1", "html_1", 1, 20,
-                List.of(), List.of(), null, 30L);
+                List.of(), List.of(), null, null, 0, 30L);
     }
 
     private static User loginUser() {

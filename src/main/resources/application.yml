@@ -3,6 +3,15 @@ spring:
   # 生产环境请使用环境变量或外部配置文件，不要把真实密钥提交到版本库。
   config:
     import: optional:file:./application-local.yml
+  # 虚拟线程：AI 流式生成会长时间占用一个请求线程，平台线程数一旦打满，新请求（哪怕只是
+  # 查询应用列表）都会排队。开启后 SSE 连接由虚拟线程承载，容量只受内存限制。
+  threads:
+    virtual:
+      enabled: ${SPRING_VIRTUAL_THREADS_ENABLED:true}
+  # 异步请求超时：SSE 生成可能持续数分钟，必须显式放宽，否则连接会被容器提前中断。
+  mvc:
+    async:
+      request-timeout: ${SPRING_MVC_ASYNC_TIMEOUT:30m}
   # Redis：Session 与对话记忆共用同一套连接配置，通过不同的 key 前缀隔离。
   data:
     redis:
@@ -61,7 +70,7 @@ app:
     key-prefix: ${COS_KEY_PREFIX:screenshot/}
     domain: ${COS_DOMAIN:}
     public-read: ${COS_PUBLIC_READ:true}
-  # AI 工作流：图片收集、提示词增强、智能路由、代码生成和项目构建。
+  # AI 工作流：图片收集、提示词增强、智能路由、代码生成、代码质检和项目构建。
   # 所有密钥都从环境变量读取，未配置时对应渠道自动降级，不影响应用启动。
   workflow:
     enabled: ${WORKFLOW_ENABLED:true}
@@ -69,6 +78,19 @@ app:
     code-generation-timeout: ${WORKFLOW_CODE_GENERATION_TIMEOUT:10m}
     image-collection-timeout: ${WORKFLOW_IMAGE_COLLECTION_TIMEOUT:4m}
     max-total-images: ${WORKFLOW_MAX_TOTAL_IMAGES:12}
+    # 代码质检：生成结束后拼接全部代码，先做静态检查再让 AI 复核；不通过时回到生成节点修复。
+    quality-check:
+      enabled: ${WORKFLOW_QUALITY_CHECK_ENABLED:true}
+      # 质检不通过或 Vue 构建失败时，最多返回生成节点修复的次数。
+      max-repair-attempts: ${WORKFLOW_QUALITY_MAX_REPAIR_ATTEMPTS:2}
+      max-files: ${WORKFLOW_QUALITY_MAX_FILES:200}
+      max-file-chars: ${WORKFLOW_QUALITY_MAX_FILE_CHARS:30000}
+      max-total-chars: ${WORKFLOW_QUALITY_MAX_TOTAL_CHARS:80000}
+      # 修复提示词中携带现有代码的上限，仅 HTML / 多文件模式使用。
+      max-repair-code-chars: ${WORKFLOW_QUALITY_MAX_REPAIR_CODE_CHARS:60000}
+      max-errors: ${WORKFLOW_QUALITY_MAX_ERRORS:20}
+      max-suggestions: ${WORKFLOW_QUALITY_MAX_SUGGESTIONS:10}
+      max-prompt-chars: ${WORKFLOW_QUALITY_MAX_PROMPT_CHARS:4000}
     content-image:
       # auto / pexels / pixabay / unsplash / mock；auto 会按顺序选择已配置密钥的渠道。
       provider: ${WORKFLOW_IMAGE_PROVIDER:auto}
@@ -121,7 +143,70 @@ app:
     # 窗口过小会让模型忘记已经写过哪些文件、从而反复调用工具，这里放宽到 100 条。
     max-messages: 100
     max-cached-conversations: 100
+    # 同一应用并发首访时等待记忆初始化的上限，超时返回“上下文加载超时”而不是无限挂起。
+    load-timeout: 10s
     key-prefix: "zgq:ai-code-mother:chat-memory:"
+  # AI 调用治理：并发、重试与工具调用保护，生产环境按模型配额调整。
+  ai:
+    # 并发控制：解决“同一时刻只能处理一个 AI 请求”的瓶颈，同时保证同一应用串行生成。
+    concurrency:
+      enabled: ${AI_CONCURRENCY_ENABLED:true}
+      # 全局同时进行的生成轮数；按目标模型的并发配额设置，默认 8。
+      max-concurrent-requests: ${AI_MAX_CONCURRENT_REQUESTS:8}
+      # 全局排队等待上限，应小于网关/前端超时。
+      acquire-timeout: ${AI_ACQUIRE_TIMEOUT:30s}
+      # 同一应用上一轮生成的最长等待时间，连续点击时快速失败并提示“正在生成中”。
+      per-app-acquire-timeout: ${AI_PER_APP_ACQUIRE_TIMEOUT:5s}
+    # 重试护轨：只在尚未输出内容、且异常可恢复时重试。
+    retry:
+      enabled: ${AI_RETRY_ENABLED:true}
+      # 含首次在内的最大尝试次数，1 表示不重试。
+      max-attempts: ${AI_RETRY_MAX_ATTEMPTS:2}
+      initial-backoff: ${AI_RETRY_INITIAL_BACKOFF:500ms}
+      max-backoff: ${AI_RETRY_MAX_BACKOFF:4s}
+      jitter: ${AI_RETRY_JITTER:0.3}
+    # 工具调用保护：防止模型反复读写同一文件形成死循环。
+    tools:
+      enabled: ${AI_TOOL_GUARD_ENABLED:true}
+      max-calls-per-turn: ${AI_TOOL_MAX_CALLS_PER_TURN:60}
+      max-repeats-per-subject: ${AI_TOOL_MAX_REPEATS:2}
+      max-repeated-denials: ${AI_TOOL_MAX_REPEATED_DENIALS:5}
+      turn-ttl: ${AI_TOOL_TURN_TTL:30m}
+      max-tracked-turns: ${AI_TOOL_MAX_TRACKED_TURNS:2000}
+  # 主页精选应用列表缓存：读多写少，通过版本号失效，Redis 不可用时自动回源数据库。
+  cache:
+    enabled: ${APP_CACHE_ENABLED:true}
+    default-ttl: ${APP_CACHE_TTL:60s}
+    good-app-list:
+      enabled: ${APP_GOOD_LIST_CACHE_ENABLED:true}
+      ttl: ${APP_GOOD_LIST_CACHE_TTL:60s}
+      max-page-num: ${APP_GOOD_LIST_CACHE_MAX_PAGE_NUM:50}
+      max-page-size: ${APP_GOOD_LIST_CACHE_MAX_PAGE_SIZE:20}
+      max-app-name-length: ${APP_GOOD_LIST_CACHE_MAX_APP_NAME_LENGTH:64}
+  # 安全：AI 接口限流限频 + 提示词审查，防止刷量、恶意输入和提示词注入。
+  security:
+    rate-limit:
+      enabled: ${RATE_LIMIT_ENABLED:true}
+      # Redis 不可用时是否放行（true=放行，false=直接拒绝）。默认放行，保证业务可用。
+      fail-open: ${RATE_LIMIT_FAIL_OPEN:true}
+      max-tracked-keys: ${RATE_LIMIT_MAX_TRACKED_KEYS:100000}
+      # 反向代理透传的真实客户端 IP 头；未部署在代理后时应保持默认或改为 X-Real-IP。
+      trusted-proxy-header: ${RATE_LIMIT_TRUSTED_PROXY_HEADER:X-Forwarded-For}
+    prompt-review:
+      enabled: ${PROMPT_REVIEW_ENABLED:true}
+      # 风险分达到 block-threshold 时直接拒绝；达到 warn-threshold 只记录告警。
+      block-threshold: ${PROMPT_REVIEW_BLOCK_THRESHOLD:70}
+      warn-threshold: ${PROMPT_REVIEW_WARN_THRESHOLD:40}
+      max-length: ${PROMPT_REVIEW_MAX_LENGTH:10000}
+      log-matches: ${PROMPT_REVIEW_LOG_MATCHES:true}
+      sanitize-enabled: ${PROMPT_REVIEW_SANITIZE_ENABLED:true}
+      # 运维补充的黑名单短语，命中直接拒绝；留空表示不启用。
+      extra-blocked-phrases: []
+  # 生成站点预览状态：版本号 + 构建状态，保证生成后立刻看到最新效果。
+  preview:
+    enabled: ${PREVIEW_STATUS_ENABLED:true}
+    ttl: ${PREVIEW_STATUS_TTL:7d}
+    max-local-entries: ${PREVIEW_STATUS_MAX_LOCAL_ENTRIES:5000}
 
 # springdoc-openapi
 springdoc:

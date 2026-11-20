@@ -92,6 +92,11 @@ public class AiCodeGeneratorServiceFactory {
     /**
      * 获取指定应用、指定生成模式的 AI Service。
      *
+     * <p>代理的创建需要反射解析接口方法、系统提示词和工具 schema，耗时明显高于一次缓存读取。
+     * 因此这里采用“锁外创建 + 锁内合并”的方式：命中缓存的请求只承受一次短暂的 map 读取，
+     * 不会因为其他应用正在创建代理而被串行化；并发首访最多重复创建一次，后创建的实例被丢弃，
+     * 由于代理本身无状态（对话状态在 ChatMemory 中），这不会影响正确性。</p>
+     *
      * @param appId       应用 id，同时作为对话记忆 id
      * @param codeGenType 代码生成类型
      * @return 可复用的 AI Service 代理
@@ -99,13 +104,29 @@ public class AiCodeGeneratorServiceFactory {
     public AiCodeGeneratorService getAiCodeGeneratorService(Long appId, CodeGenTypeEnum codeGenType) {
         validateRequest(appId, codeGenType);
         String cacheKey = buildCacheKey(appId, codeGenType);
+        AiCodeGeneratorService cached = lookupCachedService(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+        AiCodeGeneratorService created = createAiCodeGeneratorService(codeGenType);
         synchronized (serviceCache) {
-            AiCodeGeneratorService service = serviceCache.get(cacheKey);
-            if (service == null) {
-                service = createAiCodeGeneratorService(codeGenType);
-                serviceCache.put(cacheKey, service);
+            AiCodeGeneratorService existing = serviceCache.get(cacheKey);
+            if (existing != null) {
+                return existing;
             }
-            return service;
+            serviceCache.put(cacheKey, created);
+            return created;
+        }
+    }
+
+    /**
+     * 从 LRU 缓存读取已构建的代理；未命中返回 null。
+     *
+     * <p>synchronizedMap 的 get 会更新访问顺序，因此必须走同一把对象锁，保证 LRU 语义正确。</p>
+     */
+    private AiCodeGeneratorService lookupCachedService(String cacheKey) {
+        synchronized (serviceCache) {
+            return serviceCache.get(cacheKey);
         }
     }
 

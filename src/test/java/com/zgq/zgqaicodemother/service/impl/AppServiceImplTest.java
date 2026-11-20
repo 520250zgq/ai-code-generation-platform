@@ -7,7 +7,12 @@ import com.mybatisflex.core.logicdelete.LogicDeleteManager;
 import com.mybatisflex.core.paginate.Page;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.zgq.zgqaicodemother.ai.AiCodeGenTypeRoutingService;
+import com.zgq.zgqaicodemother.ai.concurrency.AiConcurrencyLimiter;
+import com.zgq.zgqaicodemother.ai.concurrency.AiConcurrencyProperties;
 import com.zgq.zgqaicodemother.ai.memory.ConversationMemoryCache;
+import com.zgq.zgqaicodemother.ai.resilience.AiRetryGuard;
+import com.zgq.zgqaicodemother.ai.resilience.AiRetryProperties;
+import com.zgq.zgqaicodemother.cache.GoodAppListCache;
 import com.zgq.zgqaicodemother.constant.AppConstant;
 import com.zgq.zgqaicodemother.core.AiCodeGeneratorFacade;
 import com.zgq.zgqaicodemother.exception.BusinessException;
@@ -20,9 +25,11 @@ import com.zgq.zgqaicodemother.model.enums.ChatHistoryMessageTypeEnum;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import com.zgq.zgqaicodemother.model.vo.AppVO;
 import com.zgq.zgqaicodemother.model.vo.UserVO;
+import com.zgq.zgqaicodemother.preview.PreviewService;
 import com.zgq.zgqaicodemother.service.ChatHistoryService;
 import com.zgq.zgqaicodemother.service.ScreenshotService;
 import com.zgq.zgqaicodemother.service.UserService;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
@@ -81,9 +88,29 @@ class AppServiceImplTest {
     @Mock
     private ScreenshotService screenshotService;
 
+    @Mock
+    private GoodAppListCache goodAppListCache;
+
+    @Mock
+    private PreviewService previewService;
+
     @Spy
     @InjectMocks
     private AppServiceImpl appService;
+
+    /**
+     * 并发控制器与重试护轨使用真实实例：
+     * 前者只用到本地信号量与锁，后者在测试中通过禁用重试等价于直接调用，
+     * 这样既不需要额外 stub，也能覆盖“许可获取/归还”和“路由调用”的真实路径。
+     */
+    @BeforeEach
+    void setUpOptimizationDependencies() {
+        ReflectionTestUtils.setField(appService, "aiConcurrencyLimiter",
+                new AiConcurrencyLimiter(new AiConcurrencyProperties()));
+        AiRetryProperties retryProperties = new AiRetryProperties();
+        retryProperties.setEnabled(false);
+        ReflectionTestUtils.setField(appService, "aiRetryGuard", new AiRetryGuard(retryProperties));
+    }
 
     @Test
     void createAppRoutesPromptAndUsesServerDefaults() {

@@ -8,6 +8,10 @@ import com.zgq.zgqaicodemother.exception.BusinessException;
 import com.zgq.zgqaicodemother.exception.ErrorCode;
 import com.zgq.zgqaicodemother.exception.ThrowUtils;
 import com.zgq.zgqaicodemother.model.entity.User;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewResult;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewService;
+import com.zgq.zgqaicodemother.security.prompt.PromptScene;
+import com.zgq.zgqaicodemother.security.ratelimit.RateLimit;
 import com.zgq.zgqaicodemother.service.UserService;
 import com.zgq.zgqaicodemother.workflow.model.WorkflowEvent;
 import com.zgq.zgqaicodemother.workflow.model.WorkflowEventMapper;
@@ -51,6 +55,9 @@ public class WorkflowController {
     @Resource
     private UserService userService;
 
+    @Resource
+    private PromptReviewService promptReviewService;
+
     /**
      * 同步执行工作流。适合测试、脚本和后台任务，前端交互请使用 SSE 接口。
      *
@@ -59,11 +66,15 @@ public class WorkflowController {
      * @return 工作流最终结果
      */
     @PostMapping("/execute")
+    @RateLimit(key = "workflow-execute", permits = 3, windowSeconds = 60)
+    @RateLimit(key = "workflow-execute-hourly", permits = 20, windowSeconds = 3600)
     public BaseResponse<WorkflowResult> execute(@RequestBody WorkflowExecuteRequest executeRequest,
                                                 HttpServletRequest request) {
         ThrowUtils.throwIf(executeRequest == null, ErrorCode.PARAMS_ERROR, "请求参数为空");
         Long appId = executeRequest.getAppId();
         ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "应用 ID 无效");
+        // 工作流会串行调用多个模型与外部工具，成本最高，提示词必须先通过安全检查。
+        executeRequest.setPrompt(reviewPrompt(executeRequest.getPrompt()));
         User loginUser = userService.getLoginUser(request);
         log.info("收到工作流同步执行请求，appId={}，promptLength={}", appId, promptLength(executeRequest.getPrompt()));
         return ResultUtils.success(workflowService.execute(appId, executeRequest.getPrompt(), loginUser));
@@ -78,13 +89,16 @@ public class WorkflowController {
      * @return SSE 事件流
      */
     @GetMapping(value = "/execute/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    @RateLimit(key = "workflow-stream", permits = 5, windowSeconds = 60)
+    @RateLimit(key = "workflow-stream-hourly", permits = 40, windowSeconds = 3600)
     public Flux<ServerSentEvent<String>> executeStream(@RequestParam Long appId,
                                                        @RequestParam(required = false) String prompt,
                                                        HttpServletRequest request) {
         ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "应用 ID 无效");
+        String safePrompt = reviewPrompt(prompt);
         User loginUser = userService.getLoginUser(request);
-        log.info("收到工作流流式执行请求，appId={}，promptLength={}", appId, promptLength(prompt));
-        return workflowService.executeStream(appId, prompt, loginUser)
+        log.info("收到工作流流式执行请求，appId={}，promptLength={}", appId, promptLength(safePrompt));
+        return workflowService.executeStream(appId, safePrompt, loginUser)
                 .map(event -> ServerSentEvent.<String>builder()
                         .event(event.type())
                         .data(JSONUtil.toJsonStr(WorkflowEventMapper.toMap(event)))
@@ -130,5 +144,23 @@ public class WorkflowController {
 
     private static int promptLength(String prompt) {
         return prompt == null ? 0 : prompt.length();
+    }
+
+    /**
+     * 审查工作流提示词。
+     *
+     * <p>提示词为空表示使用应用初始化提示词，此时不在这里审查（初始化提示词在创建应用时已经审查过），
+     * 直接返回 null 让服务层回退。</p>
+     *
+     * @param prompt 客户端传入的提示词
+     * @return 清洗后的安全提示词；入参为空时返回 null
+     */
+    private String reviewPrompt(String prompt) {
+        if (StrUtil.isBlank(prompt)) {
+            return prompt;
+        }
+        PromptReviewResult review = promptReviewService.review(prompt, PromptScene.WORKFLOW);
+        ThrowUtils.throwIf(!review.allowed(), ErrorCode.PROMPT_REJECTED, review.reason());
+        return StrUtil.isBlank(review.text()) ? prompt : review.text();
     }
 }

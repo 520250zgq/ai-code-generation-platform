@@ -5,9 +5,12 @@ import com.zgq.zgqaicodemother.constant.AppConstant;
 import com.zgq.zgqaicodemother.core.AiCodeGeneratorFacade;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import com.zgq.zgqaicodemother.workflow.config.WorkflowProperties;
+import com.zgq.zgqaicodemother.workflow.model.ProjectCode;
 import com.zgq.zgqaicodemother.workflow.state.WorkflowContext;
 import com.zgq.zgqaicodemother.workflow.state.WorkflowState;
+import com.zgq.zgqaicodemother.workflow.support.CodeQualityPromptSupport;
 import com.zgq.zgqaicodemother.workflow.support.WorkflowImageSupport;
+import com.zgq.zgqaicodemother.workflow.tools.CodeBundleTool;
 import lombok.extern.slf4j.Slf4j;
 import org.bsc.langgraph4j.action.AsyncNodeAction;
 import org.bsc.langgraph4j.prebuilt.MessagesState;
@@ -23,9 +26,13 @@ import static org.bsc.langgraph4j.action.AsyncNodeAction.node_async;
 /**
  * 代码生成节点基类。
  *
- * <p>三种生成模式复用同一套流程：取增强后的提示词 -> 调用对应 AI 生成服务 -> 校验生成目录。
+ * <p>三种生成模式复用同一套流程：取提示词 -> 调用对应 AI 生成服务 -> 校验生成目录。
  * 差异只体现在 {@link #type()} 和节点 id 上，因此用模板方法把公共逻辑收敛到基类，避免三份
  * 容易不一致的复制代码。</p>
+ *
+ * <p>质检不通过或构建失败后，工作流会重新进入同一个生成节点。此时节点会在原始提示词后
+ * 追加错误列表、改进建议和现有代码，要求模型在已有代码基础上修复而不是从零生成；
+ * HTML / 多文件模式把当前代码作为只读参考，Vue 工程模式由模型通过文件工具读取现有文件。</p>
  *
  * <p>生成失败不会抛出异常，而是写入上下文的 errorMessage，让工作流进入项目构建节点并正常
  * 结束在 END；这样调用方仍能拿到已完成步骤的上下文和明确的失败原因。</p>
@@ -37,10 +44,14 @@ public abstract class AbstractCodeGeneratorNode {
 
     protected final WorkflowProperties properties;
 
+    protected final CodeBundleTool codeBundleTool;
+
     protected AbstractCodeGeneratorNode(AiCodeGeneratorFacade aiCodeGeneratorFacade,
-                                        WorkflowProperties properties) {
+                                        WorkflowProperties properties,
+                                        CodeBundleTool codeBundleTool) {
         this.aiCodeGeneratorFacade = aiCodeGeneratorFacade;
         this.properties = properties;
+        this.codeBundleTool = codeBundleTool;
     }
 
     /**
@@ -81,8 +92,7 @@ public abstract class AbstractCodeGeneratorNode {
             context.fail("代码生成失败", "应用 ID 无效，无法确定代码保存目录");
             return WorkflowState.save(context);
         }
-        String prompt = StrUtil.isNotBlank(context.getEnhancedPrompt())
-                ? context.getEnhancedPrompt() : context.getOriginalPrompt();
+        String prompt = buildPrompt(context, expectedType);
         if (StrUtil.isBlank(prompt)) {
             context.fail("代码生成失败", "生成提示词为空");
             return WorkflowState.save(context);
@@ -120,6 +130,45 @@ public abstract class AbstractCodeGeneratorNode {
             context.fail("代码生成失败", safeErrorMessage(e));
         }
         return WorkflowState.save(context);
+    }
+
+    /**
+     * 构造本次生成使用的用户提示词。
+     *
+     * <p>首次生成直接使用提示词增强节点的结果；质检未通过或构建失败后重新进入本节点时，
+     * 会把错误列表、改进建议、构建失败信息和现有代码拼接成“修复提示词”，让模型在上一版
+     * 代码的基础上修改。构建失败信息在拼进提示词后清空，避免后续轮次重复携带已过期的错误。</p>
+     */
+    private String buildPrompt(WorkflowContext context, CodeGenTypeEnum type) {
+        String basePrompt = StrUtil.isNotBlank(context.getEnhancedPrompt())
+                ? context.getEnhancedPrompt() : context.getOriginalPrompt();
+        if (StrUtil.isBlank(basePrompt)) {
+            return basePrompt;
+        }
+        boolean repair = context.getRepairAttempts() > 0
+                || context.hasQualityIssues()
+                || StrUtil.isNotBlank(context.getBuildFailureMessage());
+        if (!repair) {
+            return basePrompt;
+        }
+        ProjectCode currentCode = null;
+        if (type != CodeGenTypeEnum.VUE_PROJECT) {
+            try {
+                currentCode = codeBundleTool.collect(context.getGeneratedCodeDir(),
+                        properties.getQualityCheck());
+            } catch (Exception e) {
+                // 读取不到旧代码时仍然可以给出错误列表，只记录告警，不阻断修复。
+                log.warn("读取待修复代码失败，workflowId={}：{}", context.getWorkflowId(), e.getMessage());
+            }
+        }
+        WorkflowProperties.QualityCheck config = properties.getQualityCheck();
+        String prompt = CodeQualityPromptSupport.buildRepairPrompt(
+                basePrompt, context.getQualityCheckResult(), context.getBuildFailureMessage(),
+                currentCode, type, config.getMaxRepairCodeChars());
+        context.clearBuildFailure();
+        log.info("本次代码生成使用修复提示词，workflowId={}，type={}，attempt={}，promptLength={}",
+                context.getWorkflowId(), type.getValue(), context.getRepairAttempts(), prompt.length());
+        return prompt;
     }
 
     /**

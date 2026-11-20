@@ -4,6 +4,7 @@ import cn.hutool.core.util.StrUtil;
 import com.zgq.zgqaicodemother.constant.AppConstant;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import dev.langchain4j.service.tool.ToolExecution;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
@@ -30,6 +31,37 @@ public abstract class AbstractFileTool implements BaseTool {
      * 流式进度中单条工具信息的最大长度。
      */
     protected static final int MAX_PROGRESS_LENGTH = 200;
+
+    /**
+     * 工具调用循环保护器。
+     *
+     * <p>默认使用无保护实例：工具在 Spring 容器之外被直接构造（例如单元测试）时不应因为
+     * 缺少依赖而失败；容器启动后由 {@code @Autowired} setter 注入真实的保护器。</p>
+     */
+    private ToolCallGuard toolCallGuard = ToolCallGuard.disabled();
+
+    /**
+     * 注入工具调用循环保护器。使用 setter 注入而不是构造器注入，是为了保留
+     * {@code new FileWriteTool()} 这种无参构造方式，工具本身不依赖 Spring 才能被测试。</p>
+     *
+     * @param toolCallGuard 保护器；容器中不存在时保持无保护实例
+     */
+    @Autowired(required = false)
+    public void setToolCallGuard(ToolCallGuard toolCallGuard) {
+        this.toolCallGuard = toolCallGuard == null ? ToolCallGuard.disabled() : toolCallGuard;
+    }
+
+    /**
+     * 执行工具前的循环保护判定。
+     *
+     * @param appId    应用 id
+     * @param toolName 工具名称
+     * @param subject  操作对象，通常是文件或目录的相对路径
+     * @return 允许或拒绝（附带给模型的提示）
+     */
+    protected ToolCallDecision checkToolCall(Long appId, String toolName, String subject) {
+        return toolCallGuard.beforeCall(appId, toolName, subject);
+    }
 
     /**
      * 当前应用的 Vue 工程根目录。

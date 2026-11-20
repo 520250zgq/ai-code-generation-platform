@@ -5,6 +5,7 @@ import cn.hutool.json.JSONUtil;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import com.zgq.zgqaicodemother.workflow.model.ImageCollectionPlan;
 import com.zgq.zgqaicodemother.workflow.model.ImageResource;
+import com.zgq.zgqaicodemother.workflow.model.QualityCheckResult;
 import org.bsc.langgraph4j.serializer.Serializer;
 
 import java.io.IOException;
@@ -53,6 +54,11 @@ public class WorkflowContextSerializer implements Serializer<WorkflowContext> {
                 ? ""
                 : JSONUtil.toJsonStr(context.getImageCollectionPlan()), out);
         writeString(JSONUtil.toJsonStr(context.getWarnings() == null ? List.of() : context.getWarnings()), out);
+        writeString(context.getQualityCheckResult() == null
+                ? ""
+                : JSONUtil.toJsonStr(context.getQualityCheckResult()), out);
+        out.writeInt(context.getRepairAttempts());
+        writeNullableString(context.getBuildFailureMessage(), out);
     }
 
     @Override
@@ -76,6 +82,9 @@ public class WorkflowContextSerializer implements Serializer<WorkflowContext> {
         String imagesJson = readString(in);
         String planJson = readString(in);
         String warningsJson = readString(in);
+        String qualityCheckJson = readString(in);
+        int repairAttempts = in.readInt();
+        String buildFailureMessage = readNullableString(in);
 
         List<ImageResource> images = StrUtil.isBlank(imagesJson)
                 ? new ArrayList<>()
@@ -85,6 +94,8 @@ public class WorkflowContextSerializer implements Serializer<WorkflowContext> {
                 : new ArrayList<>(JSONUtil.parseArray(warningsJson).toList(String.class));
         ImageCollectionPlan plan = StrUtil.isBlank(planJson) || "null".equals(planJson)
                 ? null : JSONUtil.toBean(planJson, ImageCollectionPlan.class);
+        QualityCheckResult qualityCheckResult = StrUtil.isBlank(qualityCheckJson) || "null".equals(qualityCheckJson)
+                ? null : JSONUtil.toBean(qualityCheckJson, QualityCheckResult.class);
         return WorkflowContext.builder()
                 .workflowId(workflowId)
                 .appId(appId < 0 ? null : appId)
@@ -102,6 +113,9 @@ public class WorkflowContextSerializer implements Serializer<WorkflowContext> {
                 .images(images)
                 .imageCollectionPlan(plan)
                 .warnings(warnings)
+                .qualityCheckResult(qualityCheckResult)
+                .repairAttempts(repairAttempts)
+                .buildFailureMessage(buildFailureMessage)
                 .build();
     }
 

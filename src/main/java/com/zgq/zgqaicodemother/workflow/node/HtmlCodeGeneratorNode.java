@@ -4,6 +4,7 @@ import com.zgq.zgqaicodemother.core.AiCodeGeneratorFacade;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import com.zgq.zgqaicodemother.workflow.WorkflowNodes;
 import com.zgq.zgqaicodemother.workflow.config.WorkflowProperties;
+import com.zgq.zgqaicodemother.workflow.tools.CodeBundleTool;
 import org.springframework.stereotype.Component;
 
 /**
@@ -12,8 +13,10 @@ import org.springframework.stereotype.Component;
 @Component
 public class HtmlCodeGeneratorNode extends AbstractCodeGeneratorNode {
 
-    public HtmlCodeGeneratorNode(AiCodeGeneratorFacade aiCodeGeneratorFacade, WorkflowProperties properties) {
-        super(aiCodeGeneratorFacade, properties);
+    public HtmlCodeGeneratorNode(AiCodeGeneratorFacade aiCodeGeneratorFacade,
+                                 WorkflowProperties properties,
+                                 CodeBundleTool codeBundleTool) {
+        super(aiCodeGeneratorFacade, properties, codeBundleTool);
     }
 
     @Override

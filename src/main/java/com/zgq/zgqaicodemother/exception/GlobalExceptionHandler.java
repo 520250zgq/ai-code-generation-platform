@@ -2,9 +2,14 @@ package com.zgq.zgqaicodemother.exception;
 
 import com.zgq.zgqaicodemother.common.BaseResponse;
 import com.zgq.zgqaicodemother.common.ResultUtils;
+import com.zgq.zgqaicodemother.security.ratelimit.RateLimitExceededException;
 import io.swagger.v3.oas.annotations.Hidden;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.RedisConnectionFailureException;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -23,6 +28,40 @@ public class GlobalExceptionHandler {
     public BaseResponse<?> businessExceptionHandler(BusinessException e) {
         log.error("BusinessException", e);
         return ResultUtils.error(e.getCode(), e.getMessage());
+    }
+
+    /**
+     * 限流拒绝：HTTP 状态固定返回 429，并带上 Retry-After，客户端和网关据此退避。
+     *
+     * <p>与其他业务异常不同，这里必须使用真实的 429 状态码：网关、CDN 和前端重试组件
+     * 通常只根据 HTTP 状态判断是否限流，只看响应体里的业务码会被当成普通失败而立即重试，
+     * 反而加剧流量冲击。</p>
+     *
+     * @param e 限流异常
+     * @return 429 响应
+     */
+    @ExceptionHandler(RateLimitExceededException.class)
+    public ResponseEntity<BaseResponse<?>> rateLimitExceededHandler(RateLimitExceededException e) {
+        long retryAfter = Math.max(1L, e.getRetryAfterSeconds());
+        log.warn("请求被限流，规则={}，维度={}，建议 {} 秒后重试", e.getRule(), e.getDimension(), retryAfter);
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header(HttpHeaders.RETRY_AFTER, String.valueOf(retryAfter))
+                .body(ResultUtils.error(ErrorCode.TOO_MANY_REQUESTS.getCode(), e.getMessage()));
+    }
+
+    /**
+     * 请求体不是合法 JSON 时按参数错误返回，而不是落到兜底的“系统错误”。
+     *
+     * <p>客户端拼错 JSON、用错编码或少了引号都属于调用方问题，返回 40000 可以让前端直接提示
+     * “请求格式错误”，也避免这类高频无效请求在日志里被记成服务端异常。</p>
+     *
+     * @param e 请求体解析异常
+     * @return 参数错误响应
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public BaseResponse<?> messageNotReadableHandler(HttpMessageNotReadableException e) {
+        log.warn("请求体解析失败，已按参数错误返回：{}", e.getMessage());
+        return ResultUtils.error(ErrorCode.PARAMS_ERROR, "请求体格式错误，请检查 JSON 是否完整且为 UTF-8 编码");
     }
 
     /**

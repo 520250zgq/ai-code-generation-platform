@@ -10,7 +10,10 @@ import com.mybatisflex.core.paginate.Page;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.mybatisflex.spring.service.impl.ServiceImpl;
 import com.zgq.zgqaicodemother.ai.AiCodeGenTypeRoutingService;
+import com.zgq.zgqaicodemother.ai.concurrency.AiConcurrencyLimiter;
 import com.zgq.zgqaicodemother.ai.memory.ConversationMemoryCache;
+import com.zgq.zgqaicodemother.ai.resilience.AiRetryGuard;
+import com.zgq.zgqaicodemother.cache.GoodAppListCache;
 import com.zgq.zgqaicodemother.constant.AppConstant;
 import com.zgq.zgqaicodemother.constant.ChatHistoryConstant;
 import com.zgq.zgqaicodemother.core.AiCodeGeneratorFacade;
@@ -24,6 +27,7 @@ import com.zgq.zgqaicodemother.model.entity.App;
 import com.zgq.zgqaicodemother.model.enums.ChatHistoryMessageTypeEnum;
 import com.zgq.zgqaicodemother.model.entity.User;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
+import com.zgq.zgqaicodemother.preview.PreviewService;
 import com.zgq.zgqaicodemother.model.vo.AppVO;
 import com.zgq.zgqaicodemother.model.vo.UserVO;
 import com.zgq.zgqaicodemother.service.AppService;
@@ -52,6 +56,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -98,6 +103,30 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
     @Resource
     private ScreenshotService screenshotService;
 
+    /**
+     * AI 生成并发控制器：限制全局并发，并保证同一应用同时只有一轮生成。
+     */
+    @Resource
+    private AiConcurrencyLimiter aiConcurrencyLimiter;
+
+    /**
+     * 主页精选列表缓存：读多写少，用版本号失效避免扫库。
+     */
+    @Resource
+    private GoodAppListCache goodAppListCache;
+
+    /**
+     * 预览状态服务：生成完成或构建结束后推进版本号，前端据此刷新 iframe。
+     */
+    @Resource
+    private PreviewService previewService;
+
+    /**
+     * 重试护轨：智能路由属于幂等且低成本的模型调用，允许对瞬时故障做有界重试。
+     */
+    @Resource
+    private AiRetryGuard aiRetryGuard;
+
     /** 部署静态站点的对外访问域名，由 APP_DEPLOY_HOST 环境变量配置。 */
     @Value("${app.deploy.host}")
     private String deployHost;
@@ -132,6 +161,8 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
         boolean result = this.save(app);
         // 保存失败不能返回成功 id；保存成功时 MyBatis-Flex 会把实体配置的雪花主键回填到 app。
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR, "创建应用失败");
+        // 新应用会改变“我的应用”，精选列表也可能因为分页总数变化而需要重新统计，直接让缓存失效。
+        invalidateAppListCache();
         log.info("应用创建成功，appId={}，生成类型={}，提示词长度={}",
                 app.getId(), selectedCodeGenType.getValue(), initPrompt.length());
         return app.getId();
@@ -148,7 +179,9 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
      */
     private CodeGenTypeEnum routeCodeGenType(String initPrompt) {
         try {
-            CodeGenTypeEnum selected = aiCodeGenTypeRoutingService.routeCodeGenType(initPrompt);
+            // 路由是幂等的轻量分类调用：超时、限流等瞬时故障值得重试一次，避免无谓地回退到 HTML。
+            CodeGenTypeEnum selected = aiRetryGuard.call("code-gen-routing",
+                    () -> aiCodeGenTypeRoutingService.routeCodeGenType(initPrompt));
             if (selected != null) {
                 return selected;
             }
@@ -335,6 +368,40 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
     }
 
     /**
+     * 分页查询精选应用，并在命中缓存时直接返回，避免每次打开首页都查询数据库和创建人。
+     *
+     * <p>缓存只保存脱敏后的 {@link AppVO}，不保存用户实体；未命中或缓存不可用时回源数据库，
+     * 再把结果写回缓存。缓存失效通过版本号完成，发布新版本后旧 key 会按 TTL 自然过期。</p>
+     */
+    @Override
+    public Page<AppVO> listGoodAppVOPage(AppQueryRequest appQueryRequest) {
+        ThrowUtils.throwIf(appQueryRequest == null, ErrorCode.PARAMS_ERROR, "请求参数为空");
+        Optional<Page<AppVO>> cached = goodAppListCache.find(appQueryRequest);
+        if (cached.isPresent()) {
+            return cached.get();
+        }
+        Page<AppVO> appVOPage = getAppVOPage(listAppByPage(appQueryRequest));
+        goodAppListCache.put(appQueryRequest, appVOPage);
+        return appVOPage;
+    }
+
+    /**
+     * 让精选列表缓存立即失效。
+     *
+     * <p>应用名称、封面、优先级、部署信息都会出现在精选列表中，任何写入都需要调用本方法；
+     * 服务内部写路径（创建、删除、截图回填封面）已经自动调用，控制器只需要在直接更新实体后调用。</p>
+     */
+    @Override
+    public void invalidateAppListCache() {
+        try {
+            goodAppListCache.invalidate();
+        } catch (RuntimeException e) {
+            // 缓存失效失败不能阻断业务写入；最坏情况是列表在 TTL 内展示旧数据。
+            log.warn("精选应用列表缓存失效失败，将在 TTL 后自然过期，原因={}", e.getMessage());
+        }
+    }
+
+    /**
      * 在同一事务内逻辑删除应用及其全部对话历史。
      */
     @Override
@@ -347,6 +414,9 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
         ThrowUtils.throwIf(!removed, ErrorCode.OPERATION_ERROR, "删除应用失败");
         // 应用删除后清理本地缓存和 Redis 记忆，避免残留上下文被后续同 id 数据误用。
         conversationMemoryCache.evict(appId);
+        // 预览状态也要一起清掉，否则新应用（同 id 复用）会读到旧的构建状态。
+        previewService.evict(appId);
+        invalidateAppListCache();
         return true;
     }
 
@@ -373,31 +443,51 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
             throw new BusinessException(ErrorCode.SYSTEM_ERROR, "不支持的代码生成类型");
         }
         // 5. 调用 AI 生成代码
-        // Flux.defer 让每次实际订阅对应一轮对话：先恢复对话记忆、保存用户消息，再调用模型并保存最终 AI 回复。
+        // Flux.defer 让每次实际订阅对应一轮对话：先申请并发许可，再恢复对话记忆、保存用户消息，
+        // 最后调用模型并保存最终 AI 回复。许可在流结束、取消或异常时通过 doFinally 归还。
         return Flux.defer(() -> {
-            // 先初始化对话记忆：首次会从数据库回源历史，此时本轮用户消息尚未落库，避免重复加入上下文。
-            conversationMemoryCache.get(appId);
-            chatHistoryService.saveMessage(appId, loginUser.getId(), ChatHistoryMessageTypeEnum.USER, message);
-            StringBuilder responseBuilder = new StringBuilder();
-            Flux<String> codeStream;
+            AiConcurrencyLimiter.Lease lease = aiConcurrencyLimiter.acquire(appId);
+            Flux<String> stream;
             try {
-                codeStream = aiCodeGeneratorFacade.generateAndSaveCodeStream(message, codeGenTypeEnum, appId);
+                stream = doChatToGenCode(appId, message, loginUser, codeGenTypeEnum);
             } catch (RuntimeException error) {
-                // 同步创建流失败时仍保存失败消息，保证用户消息有对应的 AI 记录。
-                saveAiFailureMessage(appId, loginUser.getId(), error);
-                return Flux.error(error);
+                // 订阅阶段就失败（例如记忆初始化抛错）时不会触发 doFinally，需要手动归还许可。
+                lease.close();
+                throw error;
             }
-            return codeStream
-                    .doOnNext(responseBuilder::append)
-                    .doOnComplete(() -> {
-                        String response = responseBuilder.toString();
-                        if (StrUtil.isNotBlank(response)) {
-                            chatHistoryService.saveMessage(appId, loginUser.getId(),
-                                    ChatHistoryMessageTypeEnum.AI, response);
-                        }
-                    })
-                    .doOnError(error -> saveAiFailureMessage(appId, loginUser.getId(), error));
+            return stream.doFinally(signal -> lease.close());
         });
+    }
+
+    /**
+     * 执行一轮真实的 AI 生成：恢复记忆、记录用户消息、生成并落库 AI 回复。
+     *
+     * <p>拆分出来是为了让并发许可的获取与释放在外层成对出现，内层只关心生成流程本身。</p>
+     */
+    private Flux<String> doChatToGenCode(Long appId, String message, User loginUser,
+                                         CodeGenTypeEnum codeGenTypeEnum) {
+        // 先初始化对话记忆：首次会从数据库回源历史，此时本轮用户消息尚未落库，避免重复加入上下文。
+        conversationMemoryCache.get(appId);
+        chatHistoryService.saveMessage(appId, loginUser.getId(), ChatHistoryMessageTypeEnum.USER, message);
+        StringBuilder responseBuilder = new StringBuilder();
+        Flux<String> codeStream;
+        try {
+            codeStream = aiCodeGeneratorFacade.generateAndSaveCodeStream(message, codeGenTypeEnum, appId);
+        } catch (RuntimeException error) {
+            // 同步创建流失败时仍保存失败消息，保证用户消息有对应的 AI 记录。
+            saveAiFailureMessage(appId, loginUser.getId(), error);
+            return Flux.error(error);
+        }
+        return codeStream
+                .doOnNext(responseBuilder::append)
+                .doOnComplete(() -> {
+                    String response = responseBuilder.toString();
+                    if (StrUtil.isNotBlank(response)) {
+                        chatHistoryService.saveMessage(appId, loginUser.getId(),
+                                ChatHistoryMessageTypeEnum.AI, response);
+                    }
+                })
+                .doOnError(error -> saveAiFailureMessage(appId, loginUser.getId(), error));
     }
 
     /**
@@ -471,6 +561,8 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
         updateApp.setDeployedTime(LocalDateTime.now());
         boolean updateResult = this.updateById(updateApp);
         ThrowUtils.throwIf(!updateResult, ErrorCode.OPERATION_ERROR, "更新应用部署信息失败");
+        // 部署时间会展示在精选列表里，写成功后立即让列表缓存失效。
+        invalidateAppListCache();
         // 10. 返回可访问的 URL
         String deployUrl = String.format("%s/%s/", deployHost.trim().replaceAll("/+$", ""), deployKey);
         // 11. 部署成功后异步生成截图并更新封面，截图失败不影响部署结果
@@ -585,6 +677,8 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App> implements AppSe
                 return;
             }
             log.info("应用封面更新成功，appId={}，cover={}", appId, coverUrl);
+            // 封面是精选列表的展示字段，回填成功后让列表缓存失效。
+            invalidateAppListCache();
         } catch (Exception e) {
             // 截图或上传失败不回滚部署，仅保留可访问的部署结果。
             log.error("部署后生成应用封面失败，appId={}，deployUrl={}", appId, deployUrl, e);

@@ -9,6 +9,7 @@ import com.zgq.zgqaicodemother.ai.tools.ToolManager;
 import com.zgq.zgqaicodemother.constant.AppConstant;
 import com.zgq.zgqaicodemother.core.builder.VueProjectBuilder;
 import com.zgq.zgqaicodemother.exception.BusinessException;
+import com.zgq.zgqaicodemother.preview.PreviewService;
 import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.model.chat.response.ChatResponse;
@@ -35,7 +36,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -51,6 +54,9 @@ class JsonMessageStreamHandlerTest {
     @Mock
     private VueProjectBuilder vueProjectBuilder;
 
+    @Mock
+    private PreviewService previewService;
+
     private JsonMessageStreamHandler handler;
 
     private final long appId = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
@@ -60,7 +66,7 @@ class JsonMessageStreamHandlerTest {
         ToolManager toolManager = new ToolManager(List.of(
                 new FileWriteTool(), new FileReadTool(), new FileDirReadTool(),
                 new FileModifyTool(), new FileDeleteTool()));
-        handler = new JsonMessageStreamHandler(vueProjectBuilder, toolManager);
+        handler = new JsonMessageStreamHandler(vueProjectBuilder, toolManager, previewService);
     }
 
     @Test
@@ -83,7 +89,7 @@ class JsonMessageStreamHandlerTest {
         ), chunks);
         String response = String.join("", chunks);
         assertFalse(response.contains("code_output"), "工具进度不能暴露服务器目录");
-        verify(vueProjectBuilder).buildProjectAsync(FileWriteTool.projectRoot(appId).toString());
+        verify(vueProjectBuilder).buildProjectAsync(eq(FileWriteTool.projectRoot(appId).toString()), any());
     }
 
     @Test
@@ -110,7 +116,7 @@ class JsonMessageStreamHandlerTest {
         String response = String.join("", chunks);
         assertFalse(response.contains("<template>"), "读取工具不能在流式进度中暴露完整文件内容");
         assertFalse(response.contains("旧内容摘要"), "修改工具只应展示首行摘要");
-        verify(vueProjectBuilder).buildProjectAsync(FileWriteTool.projectRoot(appId).toString());
+        verify(vueProjectBuilder).buildProjectAsync(eq(FileWriteTool.projectRoot(appId).toString()), any());
     }
 
     @Test
@@ -180,7 +186,7 @@ class JsonMessageStreamHandlerTest {
     @Test
     void buildTriggerFailureDoesNotBreakCompletedStream() {
         doThrow(new IllegalStateException("builder unavailable"))
-                .when(vueProjectBuilder).buildProjectAsync(anyString());
+                .when(vueProjectBuilder).buildProjectAsync(anyString(), any());
         FakeTokenStream tokenStream = new FakeTokenStream(stream -> {
             stream.emitPartial("完成");
             stream.emitComplete();

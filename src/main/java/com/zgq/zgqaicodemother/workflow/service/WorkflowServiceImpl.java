@@ -9,11 +9,13 @@ import com.zgq.zgqaicodemother.manager.CosManager;
 import com.zgq.zgqaicodemother.model.entity.App;
 import com.zgq.zgqaicodemother.model.entity.User;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
+import com.zgq.zgqaicodemother.preview.PreviewService;
 import com.zgq.zgqaicodemother.service.AppService;
 import com.zgq.zgqaicodemother.workflow.CodeGenWorkflow;
 import com.zgq.zgqaicodemother.workflow.WorkflowNodes;
 import com.zgq.zgqaicodemother.workflow.config.WorkflowProperties;
 import com.zgq.zgqaicodemother.workflow.model.ImageResource;
+import com.zgq.zgqaicodemother.workflow.model.QualityCheckResult;
 import com.zgq.zgqaicodemother.workflow.model.WorkflowEvent;
 import com.zgq.zgqaicodemother.workflow.model.WorkflowResult;
 import com.zgq.zgqaicodemother.workflow.state.WorkflowContext;
@@ -72,6 +74,11 @@ public class WorkflowServiceImpl implements WorkflowService {
     private final CosManager cosManager;
 
     /**
+     * 预览状态服务：工作流结束后推进版本号，前端据此刷新生成站点。
+     */
+    private final PreviewService previewService;
+
+    /**
      * 工作流并发许可。使用公平模式，避免高并发时个别请求长期排队。
      */
     private final Semaphore runPermits;
@@ -85,7 +92,8 @@ public class WorkflowServiceImpl implements WorkflowService {
                                UndrawIllustrationTool undrawIllustrationTool,
                                MermaidDiagramTool mermaidDiagramTool,
                                LogoGeneratorTool logoGeneratorTool,
-                               CosManager cosManager) {
+                               CosManager cosManager,
+                               PreviewService previewService) {
         this.codeGenWorkflow = codeGenWorkflow;
         this.appService = appService;
         this.properties = properties;
@@ -94,6 +102,7 @@ public class WorkflowServiceImpl implements WorkflowService {
         this.mermaidDiagramTool = mermaidDiagramTool;
         this.logoGeneratorTool = logoGeneratorTool;
         this.cosManager = cosManager;
+        this.previewService = previewService;
         this.maxConcurrentRuns = Math.max(1, properties.getMaxConcurrentRuns());
         this.runPermits = new Semaphore(maxConcurrentRuns, true);
     }
@@ -115,6 +124,7 @@ public class WorkflowServiceImpl implements WorkflowService {
             }
             context.finish();
             syncAppCodeGenType(app, context);
+            updatePreview(app, context);
             WorkflowResult result = toResult(context);
             log.info("工作流执行完成，workflowId={}，appId={}，success={}，耗时={}ms",
                     result.workflowId(), appId, result.success(), result.elapsedMs());
@@ -191,6 +201,7 @@ public class WorkflowServiceImpl implements WorkflowService {
             }
             latest.finish();
             syncAppCodeGenType(app, latest);
+            updatePreview(app, latest);
             WorkflowResult result = toResult(latest);
             emitSafely(sink, WorkflowEvent.completed(latest.getWorkflowId(),
                     result.success() ? "AI 网站生成工作流执行完成" : "AI 网站生成工作流执行结束（存在失败）",
@@ -201,6 +212,8 @@ public class WorkflowServiceImpl implements WorkflowService {
             latest.fail("工作流执行失败", safeErrorMessage(e));
             latest.finish();
             syncAppCodeGenType(app, latest);
+            // 执行异常时 Vue 工程可能已经写入部分文件但无法构建，标记为失败避免前端一直等待。
+            updatePreview(app, latest);
             if (!sink.isCancelled()) {
                 emitSafely(sink, WorkflowEvent.error(latest.getWorkflowId(),
                         "工作流执行失败：" + safeErrorMessage(e), latest.elapsedMillis(), toResult(latest)));
@@ -230,6 +243,10 @@ public class WorkflowServiceImpl implements WorkflowService {
         status.put("mermaid", mermaidDiagramTool.available());
         status.put("logo", logoGeneratorTool.available());
         status.put("cos", cosManager.isAvailable());
+        Map<String, Object> qualityCheck = new LinkedHashMap<>();
+        qualityCheck.put("enabled", properties.getQualityCheck().isEnabled());
+        qualityCheck.put("maxRepairAttempts", Math.max(0, properties.getQualityCheck().getMaxRepairAttempts()));
+        status.put("qualityCheck", qualityCheck);
         status.put("nodes", WorkflowNodes.ORDERED_NODES);
         return status;
     }
@@ -296,6 +313,8 @@ public class WorkflowServiceImpl implements WorkflowService {
             boolean updated = appService.updateById(update);
             if (updated) {
                 app.setCodeGenType(type.getValue());
+                // 生成类型和编辑时间会出现在精选列表里，写成功后让列表缓存立即失效。
+                appService.invalidateAppListCache();
                 log.info("工作流更新应用生成类型成功，appId={}，codeGenType={}",
                         app.getId(), type.getValue());
             } else {
@@ -306,6 +325,36 @@ public class WorkflowServiceImpl implements WorkflowService {
         } catch (Exception e) {
             context.addWarning("生成类型同步异常，预览或部署前请重新生成");
             log.error("工作流同步应用生成类型异常，appId={}", app.getId(), e);
+        }
+    }
+
+    /**
+     * 工作流结束后同步预览状态。
+     *
+     * <p>普通对话在生成流结束时就会标记预览；工作流的 Vue 工程由构建节点同步构建，
+     * 因此必须在这里根据构建结果一次性更新，否则前端会一直停留在“构建中”。
+     * 静态站点在代码生成节点就已落盘，这里只需要推进版本号。</p>
+     *
+     * @param app     应用实体
+     * @param context 工作流上下文
+     */
+    private void updatePreview(App app, WorkflowContext context) {
+        if (app == null || context == null || StrUtil.isBlank(context.getGeneratedCodeDir())) {
+            return;
+        }
+        CodeGenTypeEnum type = context.getGenerationType();
+        if (type == null) {
+            return;
+        }
+        try {
+            if (type == CodeGenTypeEnum.VUE_PROJECT) {
+                previewService.markBuildFinished(app.getId(), !context.hasError() && context.isBuildSuccess());
+            } else if (!context.hasError()) {
+                previewService.markGenerated(app.getId(), type);
+            }
+        } catch (RuntimeException e) {
+            // 预览状态只影响前端刷新时机，不能让它改变工作流的成败结论。
+            log.warn("同步预览状态失败，appId={}，原因={}", app.getId(), e.getMessage());
         }
     }
 
@@ -325,6 +374,17 @@ public class WorkflowServiceImpl implements WorkflowService {
                  WorkflowNodes.MULTI_FILE_CODE_GENERATOR,
                  WorkflowNodes.VUE_CODE_GENERATOR -> "代码生成完成（"
                     + (context.getGenerationType() == null ? "" : context.getGenerationType().getText()) + "）";
+            case WorkflowNodes.CODE_QUALITY_CHECK -> {
+                QualityCheckResult qualityCheck = context.getQualityCheckResult();
+                if (qualityCheck == null) {
+                    yield StrUtil.blankToDefault(context.getCurrentStep(), "代码质检完成");
+                }
+                int fileCount = qualityCheck.getCheckedFiles() == null
+                        ? 0 : qualityCheck.getCheckedFiles().size();
+                yield qualityCheck.passed()
+                        ? "代码质检通过（" + fileCount + " 个文件）"
+                        : "代码质检未通过（" + qualityCheck.errorCount() + " 个问题）";
+            }
             case WorkflowNodes.PROJECT_BUILDER -> context.getGenerationType() == CodeGenTypeEnum.VUE_PROJECT
                     ? (context.isBuildSuccess() ? "Vue 工程构建完成" : "Vue 工程构建失败")
                     : "静态文件无需构建";
@@ -355,6 +415,8 @@ public class WorkflowServiceImpl implements WorkflowService {
                 images,
                 warnings,
                 context.getErrorMessage(),
+                context.getQualityCheckResult(),
+                context.getRepairAttempts(),
                 context.elapsedMillis());
     }
 

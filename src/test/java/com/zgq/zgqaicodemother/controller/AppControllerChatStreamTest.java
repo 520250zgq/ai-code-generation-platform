@@ -3,15 +3,19 @@ package com.zgq.zgqaicodemother.controller;
 import com.zgq.zgqaicodemother.exception.BusinessException;
 import com.zgq.zgqaicodemother.exception.ErrorCode;
 import com.zgq.zgqaicodemother.model.entity.User;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewProperties;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewService;
 import com.zgq.zgqaicodemother.service.AppService;
 import com.zgq.zgqaicodemother.service.UserService;
 import jakarta.servlet.http.HttpServletRequest;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.codec.ServerSentEvent;
+import org.springframework.test.util.ReflectionTestUtils;
 import reactor.core.publisher.Flux;
 
 import java.util.List;
@@ -42,6 +46,15 @@ class AppControllerChatStreamTest {
     private AppController controller;
 
     private final User loginUser = loginUser();
+
+    /**
+     * 使用真实审查器：正常需求必须能原样通过，否则这里会误报为参数错误。
+     */
+    @BeforeEach
+    void setUpPromptReview() {
+        ReflectionTestUtils.setField(controller, "promptReviewService",
+                new PromptReviewService(new PromptReviewProperties()));
+    }
 
     @Test
     void successfulStreamEndsWithDoneEvent() {

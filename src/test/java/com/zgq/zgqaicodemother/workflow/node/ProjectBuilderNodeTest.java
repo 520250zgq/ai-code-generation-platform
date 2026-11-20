@@ -4,6 +4,7 @@ import cn.hutool.core.io.FileUtil;
 import com.zgq.zgqaicodemother.constant.AppConstant;
 import com.zgq.zgqaicodemother.core.builder.VueProjectBuilder;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
+import com.zgq.zgqaicodemother.workflow.config.WorkflowProperties;
 import com.zgq.zgqaicodemother.workflow.state.WorkflowContext;
 import com.zgq.zgqaicodemother.workflow.state.WorkflowState;
 import org.bsc.langgraph4j.prebuilt.MessagesState;
@@ -19,6 +20,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -46,7 +48,7 @@ class ProjectBuilderNodeTest {
         Path dir = createDir("html_" + IDS.incrementAndGet());
         WorkflowContext context = context(CodeGenTypeEnum.HTML, dir);
 
-        WorkflowContext updated = run(new ProjectBuilderNode(builder), context);
+        WorkflowContext updated = run(new ProjectBuilderNode(builder, new WorkflowProperties()), context);
 
         assertTrue(updated.isBuildSuccess());
         assertTrue(updated.getBuildResultDir().endsWith(dir.getFileName().toString()));
@@ -66,7 +68,7 @@ class ProjectBuilderNodeTest {
         });
         WorkflowContext context = context(CodeGenTypeEnum.VUE_PROJECT, dir);
 
-        WorkflowContext updated = run(new ProjectBuilderNode(builder), context);
+        WorkflowContext updated = run(new ProjectBuilderNode(builder, new WorkflowProperties()), context);
 
         assertTrue(updated.isBuildSuccess());
         assertTrue(updated.getBuildResultDir().endsWith("dist"));
@@ -75,14 +77,34 @@ class ProjectBuilderNodeTest {
     }
 
     @Test
-    void vueBuildFailureIsRecordedNotThrown() throws Exception {
+    void vueBuildFailureRecordsRepairInsteadOfBlockingError() throws Exception {
         VueProjectBuilder builder = mock(VueProjectBuilder.class);
         Path dir = createDir("vue_project_" + IDS.incrementAndGet());
         Files.writeString(dir.resolve("package.json"), "{}");
         when(builder.buildProject(anyString())).thenReturn(false);
         WorkflowContext context = context(CodeGenTypeEnum.VUE_PROJECT, dir);
 
-        WorkflowContext updated = run(new ProjectBuilderNode(builder), context);
+        WorkflowContext updated = run(new ProjectBuilderNode(builder, new WorkflowProperties()), context);
+
+        assertFalse(updated.isBuildSuccess());
+        assertFalse(updated.hasError(), "还有修复额度时不能直接阻断工作流");
+        assertNotNull(updated.getBuildFailureMessage());
+        assertTrue(updated.getBuildFailureMessage().contains("构建失败"));
+        assertEquals(1, updated.getRepairAttempts());
+        assertTrue(updated.getCurrentStep().contains("准备进入质检修复"));
+    }
+
+    @Test
+    void vueBuildFailureWithoutRepairBudgetIsBlockingError() throws Exception {
+        VueProjectBuilder builder = mock(VueProjectBuilder.class);
+        Path dir = createDir("vue_project_" + IDS.incrementAndGet());
+        Files.writeString(dir.resolve("package.json"), "{}");
+        when(builder.buildProject(anyString())).thenReturn(false);
+        WorkflowProperties properties = new WorkflowProperties();
+        properties.getQualityCheck().setMaxRepairAttempts(0);
+        WorkflowContext context = context(CodeGenTypeEnum.VUE_PROJECT, dir);
+
+        WorkflowContext updated = run(new ProjectBuilderNode(builder, properties), context);
 
         assertFalse(updated.isBuildSuccess());
         assertTrue(updated.hasError());
@@ -94,7 +116,7 @@ class ProjectBuilderNodeTest {
         VueProjectBuilder builder = mock(VueProjectBuilder.class);
         WorkflowContext context = context(CodeGenTypeEnum.HTML, Path.of(System.getProperty("java.io.tmpdir")));
 
-        WorkflowContext updated = run(new ProjectBuilderNode(builder), context);
+        WorkflowContext updated = run(new ProjectBuilderNode(builder, new WorkflowProperties()), context);
 
         assertTrue(updated.hasError());
         assertTrue(updated.getErrorMessage().contains("路径不合法"));
@@ -108,7 +130,7 @@ class ProjectBuilderNodeTest {
                 Path.of(AppConstant.CODE_OUTPUT_ROOT_DIR, "not_exists"));
         context.fail("代码生成失败", "上游错误");
 
-        WorkflowContext updated = run(new ProjectBuilderNode(builder), context);
+        WorkflowContext updated = run(new ProjectBuilderNode(builder, new WorkflowProperties()), context);
 
         assertEquals("项目构建跳过（上游失败）", updated.getCurrentStep());
         verifyNoInteractions(builder);

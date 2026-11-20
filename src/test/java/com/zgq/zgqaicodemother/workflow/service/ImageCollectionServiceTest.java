@@ -15,6 +15,8 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -183,6 +185,31 @@ class ImageCollectionServiceTest {
         assertTrue(outcome.images().isEmpty());
         verify(contentTool, org.mockito.Mockito.never()).searchContentImages(anyString());
         assertTrue(outcome.warnings().stream().anyMatch(w -> w.contains("没有收集到")), outcome.warnings().toString());
+    }
+
+    @Test
+    void runsImageTasksInParallel() throws Exception {
+        when(planService.planImageCollection(anyString())).thenReturn(plan(
+                List.of("a", "b"), List.of("c", "d"), List.of(), List.of()));
+        properties.getContentImage().setMaxTasks(2);
+        properties.getUndraw().setMaxTasks(2);
+        when(contentTool.describeAvailability()).thenReturn(Map.of("pexels", true));
+        when(undrawTool.available()).thenReturn(true);
+        // 四个任务必须在同一时刻到达屏障：如果工具调用是串行的，第一个任务会超时失败。
+        CyclicBarrier barrier = new CyclicBarrier(4);
+        when(contentTool.searchContentImages(anyString())).thenAnswer(invocation -> {
+            barrier.await(3, TimeUnit.SECONDS);
+            return List.of(image(ImageCategoryEnum.CONTENT, "content-" + invocation.getArgument(0)));
+        });
+        when(undrawTool.searchIllustrations(anyString())).thenAnswer(invocation -> {
+            barrier.await(3, TimeUnit.SECONDS);
+            return List.of(image(ImageCategoryEnum.ILLUSTRATION, "illustration-" + invocation.getArgument(0)));
+        });
+
+        ImageCollectionService.ImageCollectionOutcome outcome = service.collect("需求");
+
+        assertEquals(4, outcome.images().size(),
+                "图片任务必须并发执行，串行执行会在屏障处超时：" + outcome.warnings());
     }
 
     private static ImageCollectionPlan plan(List<String> contentQueries, List<String> illustrationQueries,

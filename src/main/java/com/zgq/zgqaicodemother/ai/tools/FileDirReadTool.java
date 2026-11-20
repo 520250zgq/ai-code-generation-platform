@@ -89,6 +89,11 @@ public class FileDirReadTool extends AbstractFileTool {
         if (!Files.isDirectory(target)) {
             return failure(displayPath(normalizedDir) + "，目录不存在，请先使用 readDir 查看工程根目录");
         }
+        // 目录结构在一次生成中不会频繁变化，重复读取只会浪费上下文。
+        ToolCallDecision decision = checkToolCall(appId, TOOL_NAME, displayPath(normalizedDir));
+        if (!decision.allowed()) {
+            return failure(decision.hint());
+        }
         String rootLabel = StrUtil.blankToDefault(normalizedDir, ".");
         TreeBuilder treeBuilder = new TreeBuilder();
         try {

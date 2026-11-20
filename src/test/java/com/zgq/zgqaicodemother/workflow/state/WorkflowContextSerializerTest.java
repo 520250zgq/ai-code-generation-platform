@@ -3,6 +3,7 @@ package com.zgq.zgqaicodemother.workflow.state;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import com.zgq.zgqaicodemother.workflow.model.ImageCollectionPlan;
 import com.zgq.zgqaicodemother.workflow.model.ImageResource;
+import com.zgq.zgqaicodemother.workflow.model.QualityCheckResult;
 import com.zgq.zgqaicodemother.workflow.model.enums.ImageCategoryEnum;
 import org.junit.jupiter.api.Test;
 
@@ -51,6 +52,18 @@ class WorkflowContextSerializerTest {
                         .diagramTasks(List.of(new ImageCollectionPlan.DiagramTask("flowchart LR\n A-->B", "架构")))
                         .build())
                 .warnings(new ArrayList<>(List.of("warning-1")))
+                .qualityCheckResult(QualityCheckResult.builder()
+                        .valid(false)
+                        .errors(List.of("index.html 缺少 </html> 结束标签"))
+                        .suggestions(List.of("补全结束标签"))
+                        .checkedFiles(List.of("index.html"))
+                        .checkedChars(120)
+                        .truncated(true)
+                        .source("static+ai")
+                        .durationMs(88L)
+                        .build())
+                .repairAttempts(1)
+                .buildFailureMessage("Vue 工程构建失败")
                 .build();
 
         WorkflowContext restored = roundTrip(original);
@@ -72,6 +85,18 @@ class WorkflowContextSerializerTest {
         assertEquals(List.of("warning-1"), restored.getWarnings());
         assertNotNull(restored.getStartedAt());
         assertNotNull(restored.getFinishedAt());
+        assertNotNull(restored.getQualityCheckResult());
+        assertFalse(restored.getQualityCheckResult().passed());
+        assertEquals(List.of("index.html 缺少 </html> 结束标签"),
+                restored.getQualityCheckResult().getErrors());
+        assertEquals(List.of("补全结束标签"), restored.getQualityCheckResult().getSuggestions());
+        assertEquals(List.of("index.html"), restored.getQualityCheckResult().getCheckedFiles());
+        assertEquals(120, restored.getQualityCheckResult().getCheckedChars());
+        assertTrue(restored.getQualityCheckResult().isTruncated());
+        assertEquals("static+ai", restored.getQualityCheckResult().getSource());
+        assertEquals(88L, restored.getQualityCheckResult().getDurationMs());
+        assertEquals(1, restored.getRepairAttempts());
+        assertEquals("Vue 工程构建失败", restored.getBuildFailureMessage());
     }
 
     @Test
@@ -89,6 +114,9 @@ class WorkflowContextSerializerTest {
         assertTrue(restored.getWarnings().isEmpty());
         assertEquals(null, restored.getImageCollectionPlan());
         assertEquals(null, restored.getAppId());
+        assertEquals(null, restored.getQualityCheckResult());
+        assertEquals(0, restored.getRepairAttempts());
+        assertEquals(null, restored.getBuildFailureMessage());
     }
 
     private static WorkflowContext roundTrip(WorkflowContext context) throws Exception {

@@ -2,15 +2,22 @@ package com.zgq.zgqaicodemother.core;
 
 import com.zgq.zgqaicodemother.ai.AiCodeGeneratorService;
 import com.zgq.zgqaicodemother.ai.AiCodeGeneratorServiceFactory;
+import com.zgq.zgqaicodemother.ai.resilience.AiRetryGuard;
+import com.zgq.zgqaicodemother.ai.resilience.AiRetryProperties;
+import com.zgq.zgqaicodemother.ai.tools.ToolCallGuard;
+import com.zgq.zgqaicodemother.ai.tools.ToolCallProperties;
 import com.zgq.zgqaicodemother.core.handler.JsonMessageStreamHandler;
 import com.zgq.zgqaicodemother.exception.BusinessException;
 import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
+import com.zgq.zgqaicodemother.preview.PreviewService;
 import dev.langchain4j.service.TokenStream;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
 import reactor.core.publisher.Flux;
 
 import java.time.Duration;
@@ -45,6 +52,19 @@ class AiCodeGeneratorFacadeVueStreamTest {
     private AiCodeGeneratorFacade facade;
 
     private final long appId = ThreadLocalRandom.current().nextLong(1, Long.MAX_VALUE);
+
+    /**
+     * 注入真实的护轨与保护器（重试关闭、工具预算默认值），只把预览状态服务替换为 mock。
+     * 用真实实例而不是 mock，可以顺带保证“每轮生成登记/清理工具预算”的逻辑可运行。
+     */
+    @BeforeEach
+    void setUpFacadeDependencies() {
+        AiRetryProperties retryProperties = new AiRetryProperties();
+        retryProperties.setEnabled(false);
+        ReflectionTestUtils.setField(facade, "aiRetryGuard", new AiRetryGuard(retryProperties));
+        ReflectionTestUtils.setField(facade, "toolCallGuard", new ToolCallGuard(new ToolCallProperties()));
+        ReflectionTestUtils.setField(facade, "previewService", mock(PreviewService.class));
+    }
 
     @Test
     void delegatesVueTokenStreamToJsonMessageStreamHandler() {

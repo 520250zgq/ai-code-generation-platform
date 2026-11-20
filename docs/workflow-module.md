@@ -1,6 +1,6 @@
 # AI 网站生成工作流模块
 
-本模块把“输入需求 → 收集图片 → 增强提示词 → 智能路由 → 生成代码 → 构建项目”串成一条
+本模块把“输入需求 → 收集图片 → 增强提示词 → 智能路由 → 生成代码 → 代码质检 → 构建项目”串成一条
 可观测、可降级、可复用的 AI 工作流。工作流基于 LangGraph4j 的 `StateGraph` 实现，节点和边在
 `CodeGenWorkflow` 中集中装配，业务状态放在 `WorkflowContext` 中跨节点传递。
 
@@ -11,12 +11,13 @@
 
 | 开发步骤 | 代码位置 | 说明 |
 | --- | --- | --- |
-| 1. 定义工作流结构，节点只做临时输出 | `workflow/demo/WorkflowDraft.java` | 7 个节点、条件边、START/END，节点不读写状态 |
+| 1. 定义工作流结构，节点只做临时输出 | `workflow/demo/WorkflowDraft.java` | 节点、条件边、START/END，节点不读写状态 |
 | 2. 定义状态 | `workflow/state/WorkflowContext.java` | 工作流共享状态 |
 | 3. 修改工作流图，引入状态 | `workflow/CodeGenWorkflow.java` | 正式图使用 `WorkflowContext` |
 | 4. 定义工作节点，模拟状态流转 | `workflow/demo/StatefulWorkflowDemo.java` | 假图片、假路由、假构建，可直接跑测试 |
-| 5. 图片收集节点与工具 | `workflow/node/ImageCollectorNode.java`、`workflow/tools/**` | 内容图、插画、架构图、Logo 四类工具 |
-| 6. 提示词增强、路由、代码生成、项目构建 | `workflow/node/**`、`workflow/service/**` | 完整服务 + SSE + 单元测试 |
+| 5. 图片收集节点与工具 | `workflow/node/ImageCollectorNode.java`、`workflow/tools/**` | AI 结构化规划 + 并发执行四类工具 |
+| 6. 提示词增强、路由、代码生成 | `workflow/node/**`、`workflow/service/**` | 完整服务 + SSE + 单元测试 |
+| 7. 代码质检与修复循环 | `workflow/node/CodeQualityCheckNode.java`、`docs/code-quality-check.md` | 拼接代码 + 静态检查 + AI 复核 + 条件边回生成节点 |
 | 完整工作流服务 | `WorkflowService` / `WorkflowController` | 同步执行、SSE、流程图、能力状态 |
 
 ## 2. 工作流结构
@@ -29,16 +30,29 @@ flowchart LR
   C -->|html| D[html_code_generator]
   C -->|multi_file| E[multi_file_code_generator]
   C -->|vue_project| F[vue_code_generator]
-  D --> G[project_builder 项目构建]
-  E --> G
-  F --> G
+  D --> Q[code_quality_check 代码质检]
+  E --> Q
+  F --> Q
+  Q -->|通过| G[project_builder 项目构建]
+  Q -->|不通过且有修复额度| D
+  Q -->|不通过且有修复额度| E
+  Q -->|不通过且有修复额度| F
+  G -->|Vue 构建失败且有额度| D
+  G -->|Vue 构建失败且有额度| E
+  G -->|Vue 构建失败且有额度| F
   G --> T([END])
 ```
 
-- 图片收集是一个节点，内部再按 AI 计划并发执行内容图片、插画、架构图、Logo 四类任务。
+- 图片收集是一个节点，内部先由 AI 输出结构化收集计划，再按计划并发执行内容图片、插画、
+  架构图、Logo 四类任务。选择虚拟线程 + `CompletableFuture` 而不是在图里静态展开分支，
+  是因为任务数量由 AI 计划动态决定（每类 0~N 个），静态图无法在不重建图的情况下适配。
 - 路由节点使用原始需求做分类，避免图片 URL 干扰模型判断；路由失败自动回退 HTML。
 - 三个生成节点互斥执行，节点 id 与代码保存目录的枚举值保持一致。
-- 生成节点失败时把错误写入状态，项目构建节点检测到错误后跳过构建，工作流仍在 END 正常结束，
+- 代码质检节点先拼接全部代码并做静态检查，再调用一次 AI 复核；不通过时通过条件边回到
+  对应生成节点，把错误列表、改进建议和现有代码拼进修复提示词。
+- 修复次数由 `app.workflow.quality-check.max-repair-attempts` 统一限制（默认 2 次），
+  质检失败和 Vue 构建失败共用额度，避免无限循环。
+- 生成节点失败时把错误写入状态，质检和项目构建节点检测到错误后跳过，工作流仍在 END 正常结束，
   调用方可以从结果中拿到失败原因，而不是拿到一个断开的连接。
 - HTML / 多文件模式生成的是静态文件，项目构建节点直接标记成功；Vue 工程执行
   `npm install --ignore-scripts` + `npm run build`，构建产物为 `dist`。
@@ -51,7 +65,7 @@ flowchart LR
 | --- | --- |
 | `workflowId` | 本次执行 id，用于日志和 SSE 关联 |
 | `appId` / `userId` | 目标应用和触发用户 |
-| `originalPrompt` | 用户原始需求，路由使用 |
+| `originalPrompt` | 用户原始需求，路由和质检使用 |
 | `currentStep` | 当前步骤，用于进度展示 |
 | `imageCollectionPlan` | AI 生成的图片收集计划 |
 | `images` | 收集到的图片素材（分类、描述、URL、来源） |
@@ -60,8 +74,11 @@ flowchart LR
 | `generatedCodeDir` | 代码生成目录（仅服务端使用） |
 | `buildResultDir` | 构建产物目录 |
 | `buildSuccess` | 构建是否成功 |
+| `qualityCheckResult` | 最近一次代码质检结果（是否通过、错误、建议、检查文件、耗时） |
+| `repairAttempts` | 已消耗的修复次数，质检和构建失败共用 |
+| `buildFailureMessage` | 允许继续修复时记录的构建失败原因，用于修复提示词 |
 | `errorMessage` | 首个阻断性错误 |
-| `warnings` | 非致命告警（渠道未配置、图片缺失等） |
+| `warnings` | 非致命告警（渠道未配置、图片缺失、AI 复核降级等） |
 | `startedAt` / `finishedAt` | 耗时统计 |
 
 状态通过 `WorkflowState` 与 LangGraph4j 的 `MessagesState` 互转。工作流使用自定义的
@@ -126,6 +143,19 @@ export PUPPETEER_EXECUTABLE_PATH=/path/to/chrome
 AI 计划失败、超时或返回空计划时，`ImageCollectionPlanFallback` 会用关键词规则生成兜底计划；
 单个任务失败只产生告警，不影响其他任务和后续代码生成。
 
+### 4.6 并发方案取舍
+
+图片收集的任务数量由 AI 计划动态决定（每类 0~N 个），因此没有把每个任务展开成图节点，而是：
+
+1. **先规划**：一次结构化输出拿到全部任务，避免“模型调工具 → 等结果 → 再决策”的多轮交互；
+2. **后端并发**：`ImageCollectionService` 用 `Executors.newVirtualThreadPerTaskExecutor()` 为每个任务
+   创建虚拟线程，`CompletableFuture.allOf` 等待全部完成，总超时后取消未完成任务并使用已完成结果；
+3. **故障隔离**：单个任务异常转成一条告警，不丢弃其他渠道的素材；
+4. **固定聚合**：结果按图片类别排序、按 URL 去重、按 `max-total-images` 截断，保证提示词稳定。
+
+这样不需要为动态任务数重建 LangGraph 图，虚拟线程也不会占用平台线程；并发能力由
+`ImageCollectionServiceTest.runsImageTasksInParallel` 用屏障测试锁定（串行执行会在屏障处超时）。
+
 ## 5. 提示词增强、路由与代码生成
 
 ### 5.1 提示词增强
@@ -166,11 +196,37 @@ AI 计划失败、超时或返回空计划时，`ImageCollectionPlanFallback` �
   同步失败只追加告警，不改变工作流结果。
 - Vue 工程不会在流结束时自动构建，构建统一交给 `ProjectBuilderNode`，避免重复构建。
 
+### 5.4 代码质检与修复循环
+
+节点：`workflow/node/CodeQualityCheckNode.java`，详细设计见
+[code-quality-check.md](code-quality-check.md)。
+
+三层检查：
+
+1. `CodeBundleTool` 遍历生成目录，过滤依赖/构建产物，拼接成带文件头的代码快照（有文件数和
+   字符数上限）；
+2. `CodeQualityChecks` 做确定性检查：入口文件、截断、代码围栏、本地资源引用、Vue 工程结构、
+   `package.json`、`@` 别名和模块导入路径；
+3. `CodeQualityCheckService` 用一次结构化输出调用 AI，返回 `valid / errors / suggestions`。
+
+合并后写入 `qualityCheckResult`：
+
+- 通过：进入项目构建；
+- 不通过且还有修复额度：占用一次额度，条件边回到对应生成节点；生成节点使用
+  `CodeQualityPromptSupport` 构造修复提示词，包含错误列表、改进建议、构建失败信息和现有代码
+  （HTML / 多文件），要求“在现有代码基础上修改、输出完整文件”，而不是从零生成；
+- 不通过且额度用尽：写入阻断性错误，工作流在 END 结束并返回错误列表。
+
+AI 复核超时、限流或返回非法 JSON 时降级为“仅静态检查”，并记录告警；质检关闭时不做 AI 调用，
+构建结果直接决定成败。
+
 ## 6. 项目构建
 
 - HTML / 多文件：无需构建，`buildResultDir = generatedCodeDir`。
 - Vue：校验 `package.json`，调用现有 `VueProjectBuilder.buildProject`，成功则返回 `dist` 目录，
-  失败写入错误并保留源码目录。
+  失败则记录 `buildFailureMessage`。
+- 构建失败等价于“无法正常打包”：质检开启且还有修复额度时，构建节点只占用一次额度并通过条件边
+  回到生成节点，把构建错误拼进修复提示词；额度用尽或质检关闭时才写入阻断性错误。
 - 构建前校验目录必须位于 `tmp/code_output` 下，防止上下文被篡改后构建任意目录。
 
 ## 7. 对外接口
@@ -218,11 +274,25 @@ Content-Type: application/json
     ],
     "warnings": [],
     "errorMessage": null,
+    "qualityCheck": {
+      "valid": true,
+      "errors": [],
+      "suggestions": ["首屏图片建议增加 loading=\"lazy\""],
+      "checkedFiles": ["index.html", "style.css", "script.js"],
+      "checkedChars": 8600,
+      "truncated": false,
+      "source": "static+ai",
+      "durationMs": 5320
+    },
+    "repairAttempts": 0,
     "elapsedMs": 107403
   },
   "message": "ok"
 }
 ```
+
+质检未通过时 `qualityCheck.valid=false`，`errors` 给出包含文件名的具体问题；
+`repairAttempts` 表示本次执行因质检或构建失败自动修复了几轮。
 
 ### 7.2 SSE 流式执行
 
@@ -270,6 +340,7 @@ GET /api/workflow/status
   "mermaid": true,
   "logo": true,
   "cos": true,
+  "qualityCheck": {"enabled": true, "maxRepairAttempts": 2},
   "nodes": ["image_collector", "..."]
 }
 ```
@@ -285,6 +356,15 @@ GET /api/workflow/status
 | `code-generation-timeout` | `WORKFLOW_CODE_GENERATION_TIMEOUT` | `10m` | 代码生成等待上限 |
 | `image-collection-timeout` | `WORKFLOW_IMAGE_COLLECTION_TIMEOUT` | `4m` | 图片收集总等待上限 |
 | `max-total-images` | `WORKFLOW_MAX_TOTAL_IMAGES` | `12` | 单次最多保留图片数 |
+| `quality-check.enabled` | `WORKFLOW_QUALITY_CHECK_ENABLED` | `true` | 是否启用代码质检与修复循环 |
+| `quality-check.max-repair-attempts` | `WORKFLOW_QUALITY_MAX_REPAIR_ATTEMPTS` | `2` | 质检/构建失败共用的修复上限 |
+| `quality-check.max-files` | `WORKFLOW_QUALITY_MAX_FILES` | `200` | 单次质检最多读取文件数 |
+| `quality-check.max-file-chars` | `WORKFLOW_QUALITY_MAX_FILE_CHARS` | `30000` | 单文件读取上限 |
+| `quality-check.max-total-chars` | `WORKFLOW_QUALITY_MAX_TOTAL_CHARS` | `80000` | 质检代码总字符上限 |
+| `quality-check.max-repair-code-chars` | `WORKFLOW_QUALITY_MAX_REPAIR_CODE_CHARS` | `60000` | 修复提示词携带代码上限 |
+| `quality-check.max-errors` | `WORKFLOW_QUALITY_MAX_ERRORS` | `20` | 最多保留错误条数 |
+| `quality-check.max-suggestions` | `WORKFLOW_QUALITY_MAX_SUGGESTIONS` | `10` | 最多保留建议条数 |
+| `quality-check.max-prompt-chars` | `WORKFLOW_QUALITY_MAX_PROMPT_CHARS` | `4000` | 质检请求中的需求长度上限 |
 | `content-image.provider` | `WORKFLOW_IMAGE_PROVIDER` | `auto` | `auto/pexels/pixabay/unsplash/mock` |
 | `content-image.pexels.api-key` | `PEXELS_API_KEY` | 空 | Pexels Key（可选） |
 | `content-image.pixabay.api-key` | `PIXABAY_API_KEY` | 本地已配置 | Pixabay Key |
@@ -349,16 +429,20 @@ langchain4j:
   所有外部请求都有连接/读取超时和响应大小上限。
 - **命令注入**：Mermaid CLI 使用参数列表启动进程，不经过 shell；代码校验拒绝危险指令。
 - **路径穿越**：生成目录由枚举 + 数字 appId 组成；构建节点再次校验目录必须位于代码输出根目录。
-- **提示词注入**：外部图片描述会被清洗并放在“这是元数据”的清单中；避免把任意文本当作指令。
+  代码质检工具读取文件前也会校验目录前缀，并拒绝 `..` 逃逸。
+- **提示词注入**：外部图片描述会被清洗并放在“这是元数据”的清单中；质检返回的错误和建议
+  进入修复提示词前同样会压缩空白、去控制字符并截断长度；代码文本只放在固定的“只读参考”标题下。
 - **状态序列化**：工作流状态使用显式字段 + JSON，不反序列化不可信类名。
-- **并发与超时**：工作流并发信号量、代码生成超时、图片任务总超时、外部 HTTP 超时。
+- **并发与超时**：工作流并发信号量、代码生成超时、图片任务总超时、外部 HTTP 超时、
+  质检代码长度上限。
+- **成本控制**：质检每次最多一次模型调用，修复次数有全局上限，避免循环放大 token 成本。
 - **构建安全**：沿用 `VueProjectBuilder` 的 `npm install --ignore-scripts`，禁止依赖生命周期脚本。
 
 ## 10. 测试
 
 ```bash
 # 工作流相关单元测试（不访问外部网络）
-./mvnw -q "-Dtest=Workflow*Test,CodeGenWorkflowTest,ImageCollectionServiceTest,ContentImageSearchToolTest,UndrawIllustrationToolTest,MermaidDiagramToolTest,LogoGeneratorToolTest" test
+./mvnw -q "-Dtest=Workflow*Test,CodeGenWorkflowTest,ImageCollectionServiceTest,ContentImageSearchToolTest,UndrawIllustrationToolTest,MermaidDiagramToolTest,LogoGeneratorToolTest,CodeQualityCheckNodeTest,CodeBundleToolTest,CodeQualityChecksTest,CodeQualityCheckServiceTest" test
 
 # 全量测试
 ./mvnw test
@@ -367,16 +451,22 @@ langchain4j:
 测试覆盖：
 
 - 工作流草稿和状态模拟的节点顺序、条件分支；
-- `WorkflowContext` 字段、告警截断、序列化往返；
+- `WorkflowContext` 字段、告警截断、序列化往返（含质检结果、修复次数、构建失败信息）；
 - 图片 URL 安全校验、描述清洗、去重截断；
 - Pexels/Pixabay/Unsplash 响应解析、Picsum 降级；
 - unDraw `__NEXT_DATA__` 解析和域名限制；
 - Mermaid 安全校验、渲染器上传、临时目录清理；
 - DashScope 轮询、错误、转存 COS、失败降级；
-- 图片收集并发聚合、任务截断、渠道不可用告警；
-- 三路路由图执行、构建成功/失败、上游失败跳过构建；
+- 图片收集并发聚合、**任务真实并发执行**（屏障测试）、任务截断、渠道不可用告警；
+- 代码拼接工具的过滤、排序、空文件、文件数/字符数截断和非法目录；
+- 静态检查：入口缺失/截断、代码围栏、本地资源、Vue 构建必需文件、`@` 别名、模块导入；
+- 质检节点：通过、失败请求修复、额度耗尽阻断、静态错误压过 AI 结论、AI 降级、
+  上游失败跳过、关闭开关、空目录；
+- 三路路由图执行、质检失败后修复并成功、额度耗尽终止、Vue 构建失败后修复并成功、
+  关闭质检仍能构建、上游失败跳过构建；
+- 修复提示词包含错误、建议、构建错误、现有代码和“输出完整文件”约束；
 - 代码生成超时、输出目录缺失、路由类型不一致；
-- 工作流服务的应用归属校验、并发限制、相对路径脱敏、SSE 事件；
+- 工作流服务的应用归属校验、并发限制、相对路径脱敏、SSE 事件与新增结果字段；
 - 控制器的同步结果、SSE 映射和错误事件；
 - AI Service 工厂的工作流隔离记忆。
 
@@ -409,9 +499,13 @@ langchain4j:
    并在提示词中控制素材数量。工作流已通过超时和截断把失败变成可读错误。
 6. **未持久化运行记录**：工作流结果不写入数据库，SSE 断开后无法查询历史；如需运行历史，
    可新增 `workflow_run` 表和状态接口。
-7. **未包含代码质检节点**：需求中的 13 个步骤没有 AI 质检；如需质检循环，可在生成节点后增加
-   `code_quality_check` 节点和条件边（参考 `CodeGenWorkflow` 的条件边写法）。
-8. **无前端页面**：本次交付为后端工作流和接口；前端可直接消费 SSE 事件或调用同步接口。
-9. **外部渠道无自动重试**：单次任务失败只降级/告警，不自动重试，避免放大第三方接口成本；
-   如需可靠性可增加带退避的重试策略。
-10. **无按用户限流**：目前只有全局并发信号量，生产环境建议在网关或服务层增加用户级限流。
+7. **代码质检的模型判断存在不确定性**：确定性静态检查只覆盖“确定性问题”，更隐蔽的
+   运行时错误仍依赖 AI 复核；模型漏判时工作流会当作通过继续构建。质检失败后的修复轮数
+   默认只有 2 次，复杂问题可能需要人工介入。
+8. **质检代码有长度上限**：超过 `max-total-chars` 时只检查前面的文件，结果中
+   `qualityCheck.truncated=true`；超大工程建议拆分为多个应用或调高上限（需同步评估模型上下文）。
+9. **无前端页面**：本次交付为后端工作流和接口；前端可直接消费 SSE 事件或调用同步接口，
+   并展示 `qualityCheck` 与 `repairAttempts`。
+10. **外部渠道无自动重试**：单次任务失败只降级/告警，不自动重试，避免放大第三方接口成本；
+    如需可靠性可增加带退避的重试策略。
+11. **无按用户限流**：目前只有全局并发信号量，生产环境建议在网关或服务层增加用户级限流。

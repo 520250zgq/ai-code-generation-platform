@@ -54,6 +54,18 @@ class CodeGenPromptContractTest {
         assertTrue(prompt.contains("停止调用工具"), "修改完成后必须停止工具调用");
     }
 
+    @Test
+    void qualityCheckPromptDefinesStructuredVerdictAndStrictErrors() throws IOException {
+        String prompt = readPrompt("prompt/code-quality-check-system-prompt.txt");
+
+        assertTrue(prompt.contains("\"valid\""), "质检提示词必须约定 valid 字段");
+        assertTrue(prompt.contains("\"errors\""), "质检提示词必须约定 errors 字段");
+        assertTrue(prompt.contains("\"suggestions\""), "质检提示词必须约定 suggestions 字段");
+        assertTrue(prompt.contains("构建失败"), "必须要求检查能否正常打包");
+        assertTrue(prompt.contains("不要重复报告"), "静态检查已列出的问题不能重复报告");
+        assertTrue(prompt.contains("errors 每条必须包含文件名"), "错误必须可定位到文件");
+    }
+
     private static String readPrompt(String resourcePath) throws IOException {
         try (InputStream inputStream = CodeGenPromptContractTest.class.getClassLoader()
                 .getResourceAsStream(resourcePath)) {

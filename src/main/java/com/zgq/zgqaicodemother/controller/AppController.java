@@ -16,7 +16,14 @@ import com.zgq.zgqaicodemother.exception.BusinessException;
 import com.zgq.zgqaicodemother.model.dto.app.*;
 import com.zgq.zgqaicodemother.model.entity.App;
 import com.zgq.zgqaicodemother.model.entity.User;
+import com.zgq.zgqaicodemother.model.enums.CodeGenTypeEnum;
 import com.zgq.zgqaicodemother.model.vo.AppVO;
+import com.zgq.zgqaicodemother.preview.PreviewService;
+import com.zgq.zgqaicodemother.preview.PreviewStatus;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewResult;
+import com.zgq.zgqaicodemother.security.prompt.PromptReviewService;
+import com.zgq.zgqaicodemother.security.prompt.PromptScene;
+import com.zgq.zgqaicodemother.security.ratelimit.RateLimit;
 import com.zgq.zgqaicodemother.service.AppService;
 import com.zgq.zgqaicodemother.service.UserService;
 import jakarta.annotation.Resource;
@@ -49,6 +56,12 @@ public class AppController {
     @Resource
     private UserService userService;
 
+    @Resource
+    private PromptReviewService promptReviewService;
+
+    @Resource
+    private PreviewService previewService;
+
     /**
      * 创建应用并返回应用 id，初始化提示词是唯一允许由客户端指定的创建参数。
      * 生成类型由服务层调用 AI 智能路由选择；服务层统一负责名称、创建人和兜底策略。
@@ -58,11 +71,20 @@ public class AppController {
      * @return 应用 id
      */
     @PostMapping("/add")
+    @RateLimit(key = "app-create", permits = 5, windowSeconds = 60)
+    @RateLimit(key = "app-create-hourly", permits = 30, windowSeconds = 3600)
     public BaseResponse<Long> addApp(@RequestBody AppAddRequest appAddRequest, HttpServletRequest request) {
         ThrowUtils.throwIf(appAddRequest == null, ErrorCode.PARAMS_ERROR);
         // 全空白提示词没有有效的应用需求，提前返回参数错误，避免写入无意义的数据。
         ThrowUtils.throwIf(StrUtil.isBlank(appAddRequest.getInitPrompt()), ErrorCode.PARAMS_ERROR,
                 "初始化 prompt 不能为空");
+        // 安全检查放在登录查询之前：恶意输入不应该触发数据库查询，也不应该消耗后续的 AI 配额。
+        PromptReviewResult review = promptReviewService.review(appAddRequest.getInitPrompt(),
+                PromptScene.APP_CREATE);
+        ThrowUtils.throwIf(!review.allowed(), ErrorCode.PROMPT_REJECTED, review.reason());
+        String safePrompt = safeReviewedText(review, appAddRequest.getInitPrompt());
+        // 用清洗后的文本覆盖原始输入，后续落库和提示词拼装都使用这份安全文本。
+        appAddRequest.setInitPrompt(safePrompt);
         // 创建人必须来自登录态；不能信任客户端提供的 userId，否则可冒用其他用户创建应用。
         User loginUser = userService.getLoginUser(request);
         // 创建、命名、智能路由和持久化集中在服务层，避免控制器和其他入口出现两套创建规则。
@@ -101,6 +123,8 @@ public class AppController {
         app.setEditTime(LocalDateTime.now());
         boolean result = appService.updateById(app);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+        // 名称会出现在精选列表里，写成功后立即让列表缓存失效。
+        appService.invalidateAppListCache();
         return ResultUtils.success(true);
     }
 
@@ -182,8 +206,8 @@ public class AppController {
         userService.getLoginUser(request);
         // 精选优先级由服务端指定，不能被客户端覆盖。
         queryRequest.setPriority(AppConstant.GOOD_APP_PRIORITY);
-        Page<App> appPage = appService.listAppByPage(queryRequest);
-        return ResultUtils.success(appService.getAppVOPage(appPage));
+        // 精选列表是首页最高的读请求来源：命中缓存时不再查询数据库和创建人表。
+        return ResultUtils.success(appService.listGoodAppVOPage(queryRequest));
     }
 
     /**
@@ -211,6 +235,8 @@ public class AppController {
         app.setEditTime(LocalDateTime.now());
         boolean result = appService.updateById(app);
         ThrowUtils.throwIf(!result, ErrorCode.OPERATION_ERROR);
+        // 管理员最常改的就是“精选优先级”，这里必须立即失效，否则首页要等 TTL 才更新。
+        appService.invalidateAppListCache();
         return ResultUtils.success(true);
     }
 
@@ -269,7 +295,11 @@ public class AppController {
     }
 
     /**
-     * 应用聊天生成代码（流式 SSE）
+     * 应用聊天生成代码（流式 SSE）。
+     *
+     * <p>这是最昂贵的接口：一次调用会消耗模型配额和数分钟的服务端资源。因此同时加了两道保护：
+     * 限流（按用户与 IP 双维度）和提示词安全检查。审查通过的文本会替换原始入参，
+     * 后续写入对话历史和拼装模型上下文时都使用清洗后的版本。</p>
      *
      * @param appId   应用 ID
      * @param message 用户消息
@@ -277,16 +307,22 @@ public class AppController {
      * @return 生成结果流
      */
     @GetMapping(value = "/chat/gen/code", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    @RateLimit(key = "ai-chat", permits = 10, windowSeconds = 60)
+    @RateLimit(key = "ai-chat-hourly", permits = 120, windowSeconds = 3600)
     public Flux<ServerSentEvent<String>> chatToGenCode(@RequestParam Long appId,
                                                        @RequestParam String message,
                                                        HttpServletRequest request) {
         // 参数校验
         ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "应用ID无效");
         ThrowUtils.throwIf(StrUtil.isBlank(message), ErrorCode.PARAMS_ERROR, "用户消息不能为空");
+        // 安全检查必须在登录查询和模型调用之前完成，避免恶意输入消耗数据库与模型资源。
+        PromptReviewResult review = promptReviewService.review(message, PromptScene.CHAT);
+        ThrowUtils.throwIf(!review.allowed(), ErrorCode.PROMPT_REJECTED, review.reason());
+        String safeMessage = safeReviewedText(review, message);
         // 获取当前登录用户
         User loginUser = userService.getLoginUser(request);
         // 调用服务生成代码（流式）
-        Flux<String> contentFlux = appService.chatToGenCode(appId, message, loginUser);
+        Flux<String> contentFlux = appService.chatToGenCode(appId, safeMessage, loginUser);
         // 转换为 ServerSentEvent 格式
         return contentFlux
                 .map(chunk -> {
@@ -317,6 +353,39 @@ public class AppController {
                             .data(jsonData)
                             .build());
                 });
+    }
+
+    /**
+     * 查询生成站点的预览状态。
+     *
+     * <p>前端在生成流结束后立即调用本接口：静态模式直接拿到 READY 和新的版本号；
+     * Vue 工程拿到 BUILDING，并在构建完成后通过版本号变化自动刷新 iframe。
+     * 这样用户既不会看到旧版本，也不需要手动刷新页面。</p>
+     *
+     * @param appId   应用 ID
+     * @param request 用于校验登录态
+     * @return 预览状态快照
+     */
+    @GetMapping("/preview/{appId}")
+    public BaseResponse<PreviewStatus> getPreviewStatus(@PathVariable Long appId, HttpServletRequest request) {
+        ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "应用 ID 无效");
+        userService.getLoginUser(request);
+        App app = appService.getById(appId);
+        ThrowUtils.throwIf(app == null, ErrorCode.NOT_FOUND_ERROR, "应用不存在");
+        CodeGenTypeEnum codeGenType = CodeGenTypeEnum.getEnumByValue(app.getCodeGenType());
+        return ResultUtils.success(previewService.snapshot(appId, codeGenType));
+    }
+
+    /**
+     * 取审查后的安全文本：清洗结果为空时回退到原始输入（此时必然已通过审查）。
+     *
+     * @param review 审查结果
+     * @param raw    原始输入
+     * @return 可送入模型和落库的文本
+     */
+    private static String safeReviewedText(PromptReviewResult review, String raw) {
+        String sanitized = review == null ? null : review.text();
+        return StrUtil.isBlank(sanitized) ? raw : sanitized;
     }
 
     /**

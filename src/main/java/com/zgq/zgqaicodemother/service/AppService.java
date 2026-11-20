@@ -87,6 +87,23 @@ public interface AppService extends IService<App> {
     Page<App> listAppByPage(AppQueryRequest appQueryRequest);
 
     /**
+     * 分页查询精选应用，命中缓存时直接返回视图分页。
+     *
+     * <p>精选列表是首页读多写少的场景：先查 Redis 缓存，未命中再查数据库并回填缓存。
+     * 缓存不可用时自动退化为直接查库，不影响功能。</p>
+     *
+     * @param appQueryRequest 已限定精选优先级和分页范围的查询条件
+     * @return 附带创建者信息的分页视图
+     */
+    Page<AppVO> listGoodAppVOPage(AppQueryRequest appQueryRequest);
+
+    /**
+     * 让精选列表缓存立即失效。应用名称、封面、优先级等字段变更后必须调用，
+     * 否则首页在缓存 TTL 内会展示旧数据。
+     */
+    void invalidateAppListCache();
+
+    /**
      * 删除应用及其对话历史；两项逻辑删除应在同一事务中完成。
      */
     boolean removeAppWithChatHistory(Long appId);

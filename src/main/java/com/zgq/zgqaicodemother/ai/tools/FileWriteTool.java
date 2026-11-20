@@ -85,6 +85,17 @@ public class FileWriteTool extends AbstractFileTool {
         if (target == null) {
             return failure(normalizedPath + "，路径必须位于当前应用工程目录内");
         }
+        // 重复写同一个文件是工具调用死循环最常见的形态：先由保护器判定是否该拦截，
+        // 再判断“内容是否本来就一致”，避免同一份内容被反复落盘。
+        ToolCallDecision decision = checkToolCall(appId, TOOL_NAME, normalizedPath);
+        if (!decision.allowed()) {
+            return failure(decision.hint());
+        }
+        String existingContent = readExistingContent(target);
+        if (existingContent != null && existingContent.equals(content)) {
+            log.info("Vue 工程文件内容未变化，跳过重复写入，appId={}，相对路径={}", appId, normalizedPath);
+            return SUCCESS_PREFIX + normalizedPath + "（内容与现有文件一致，已跳过重复写入）";
+        }
         try {
             Path parent = target.getParent();
             if (parent != null) {
@@ -101,6 +112,26 @@ public class FileWriteTool extends AbstractFileTool {
             // 日志保留绝对路径便于排查，但返回给模型的内容不能包含服务器路径。
             log.error("Vue 工程文件写入失败，appId={}，相对路径={}", appId, normalizedPath, e);
             return failure(normalizedPath + "，服务端写入失败，请检查路径后重试一次");
+        }
+    }
+
+    /**
+     * 读取目标文件现有内容，用于幂等判断。
+     *
+     * <p>读取失败（不存在、权限问题、编码异常）时返回 null，表示“无法确认内容一致”，
+     * 后续仍然执行写入，不能因为幂等优化而丢掉正常的写入能力。</p>
+     *
+     * @param target 工程内的目标文件
+     * @return 现有内容；文件不存在或读取失败返回 null
+     */
+    private static String readExistingContent(Path target) {
+        try {
+            if (!Files.isRegularFile(target)) {
+                return null;
+            }
+            return Files.readString(target, StandardCharsets.UTF_8);
+        } catch (IOException | SecurityException e) {
+            return null;
         }
     }
 

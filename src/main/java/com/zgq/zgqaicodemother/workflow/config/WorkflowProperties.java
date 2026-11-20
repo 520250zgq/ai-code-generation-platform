@@ -41,6 +41,11 @@ public class WorkflowProperties {
     private int maxTotalImages = 12;
 
     /**
+     * 代码质检配置。
+     */
+    private QualityCheck qualityCheck = new QualityCheck();
+
+    /**
      * 内容图片渠道配置。
      */
     private ContentImage contentImage = new ContentImage();
@@ -59,6 +64,63 @@ public class WorkflowProperties {
      * Logo 文生图配置。
      */
     private Logo logo = new Logo();
+
+    /**
+     * 代码质检配置。
+     *
+     * <p>质检节点会先做确定性检查（文件完整性、本地资源引用、Vue 工程结构与导入路径），
+     * 再把拼接后的代码交给 AI 复核。发现问题时通过条件边回到代码生成节点修复，最多修复
+     * {@code maxRepairAttempts} 次，避免模型与质检互相“踢皮球”导致无限循环。</p>
+     */
+    @Data
+    public static class QualityCheck {
+
+        /**
+         * 是否启用代码质检。关闭后不调用 AI、不做修复循环，构建结果直接决定成败。
+         */
+        private boolean enabled = true;
+
+        /**
+         * 质检不通过时允许返回代码生成节点修复的次数上限。0 表示只检查、不修复。
+         */
+        private int maxRepairAttempts = 2;
+
+        /**
+         * 单次质检最多读取的代码文件数量，避免超大工程把提示词撑爆。
+         */
+        private int maxFiles = 200;
+
+        /**
+         * 单个文件最多读取的字符数，超出部分截断并标记。
+         */
+        private int maxFileChars = 30_000;
+
+        /**
+         * 拼接后代码总字符上限。超出后只检查前面的文件，并记录截断告警。
+         */
+        private int maxTotalChars = 80_000;
+
+        /**
+         * 修复提示词中携带现有代码的字符上限，仅 HTML / 多文件模式使用；
+         * Vue 工程模式由模型通过文件工具读取现有文件，不需要重复贴代码。
+         */
+        private int maxRepairCodeChars = 60_000;
+
+        /**
+         * 单次质检最多保留的错误条数。
+         */
+        private int maxErrors = 20;
+
+        /**
+         * 单次质检最多保留的改进建议条数。
+         */
+        private int maxSuggestions = 10;
+
+        /**
+         * 质检请求中携带用户原始需求的最大长度，避免历史长需求挤占代码位置。
+         */
+        private int maxPromptChars = 4_000;
+    }
 
     /**
      * 内容图片搜索配置。

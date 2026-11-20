@@ -68,6 +68,29 @@ public final class WorkflowEventMapper {
         data.put("elapsedMs", result.elapsedMs());
         data.put("warnings", result.warnings() == null ? List.of() : List.copyOf(result.warnings()));
         data.put("images", imagesToMaps(result.images()));
+        data.put("repairAttempts", result.repairAttempts());
+        putIfNotNull(data, "qualityCheck", qualityCheckToMap(result.qualityCheck()));
+        return data;
+    }
+
+    /**
+     * 质检结果转 Map。只输出相对文件名、错误和建议，不输出代码正文。
+     */
+    private static Map<String, Object> qualityCheckToMap(QualityCheckResult qualityCheck) {
+        if (qualityCheck == null) {
+            return null;
+        }
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("valid", qualityCheck.passed());
+        data.put("errors", qualityCheck.getErrors() == null ? List.of() : List.copyOf(qualityCheck.getErrors()));
+        data.put("suggestions", qualityCheck.getSuggestions() == null
+                ? List.of() : List.copyOf(qualityCheck.getSuggestions()));
+        data.put("checkedFiles", qualityCheck.getCheckedFiles() == null
+                ? List.of() : List.copyOf(qualityCheck.getCheckedFiles()));
+        data.put("checkedChars", qualityCheck.getCheckedChars());
+        data.put("truncated", qualityCheck.isTruncated());
+        putIfNotNull(data, "source", qualityCheck.getSource());
+        data.put("durationMs", qualityCheck.getDurationMs());
         return data;
     }
 

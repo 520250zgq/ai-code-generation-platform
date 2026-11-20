@@ -14,9 +14,11 @@ import java.util.Arrays;
 import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
  * Vue 工程构建器。
@@ -61,6 +63,14 @@ public class VueProjectBuilder {
     private final Set<String> pendingBuilds = ConcurrentHashMap.newKeySet();
 
     /**
+     * 构建结束后的回调，按工程路径登记。
+     *
+     * <p>用于把“构建完成”同步到预览状态服务。同一工程重复提交构建请求时只保留最新回调：
+     * 回调做的事情一致（标记预览就绪或失败），保留最新回调可以避免为同一结果登记多份通知。</p>
+     */
+    private final Map<String, Consumer<Boolean>> completionCallbacks = new ConcurrentHashMap<>();
+
+    /**
      * 构建状态和排队集合的调度锁，保证“检查占用 + 登记排队”和“结束占用 + 检查排队”不会交错。
      */
     private final Object buildSchedulingLock = new Object();
@@ -75,11 +85,28 @@ public class VueProjectBuilder {
      * @param projectPath Vue 工程根目录
      */
     public void buildProjectAsync(String projectPath) {
+        buildProjectAsync(projectPath, null);
+    }
+
+    /**
+     * 在虚拟线程中异步构建 Vue 项目，并在构建（含排队的后续构建）全部结束时回调结果。
+     *
+     * <p>回调只会在构建循环真正结束时触发一次，参数是最后一轮构建是否成功。
+     * 回调内部抛出的异常会被捕获并记录，不能影响构建线程。</p>
+     *
+     * @param projectPath        Vue 工程根目录
+     * @param completionCallback 构建结束回调，允许为 null
+     */
+    public void buildProjectAsync(String projectPath, Consumer<Boolean> completionCallback) {
         if (projectPath == null || projectPath.isBlank()) {
             log.warn("跳过 Vue 项目构建：工程路径为空");
+            notifyCompletion(null, false, completionCallback);
             return;
         }
         String normalizedPath = new File(projectPath).getAbsolutePath();
+        if (completionCallback != null) {
+            completionCallbacks.put(normalizedPath, completionCallback);
+        }
         synchronized (buildSchedulingLock) {
             if (!buildingProjects.add(normalizedPath)) {
                 pendingBuilds.add(normalizedPath);
@@ -106,6 +133,7 @@ public class VueProjectBuilder {
                 pendingBuilds.remove(normalizedPath);
             }
             log.error("创建 Vue 构建虚拟线程失败：{}", normalizedPath, e);
+            notifyCompletion(normalizedPath, false, null);
         }
     }
 
@@ -115,6 +143,7 @@ public class VueProjectBuilder {
      * @param normalizedPath 归一化后的工程绝对路径
      */
     private void runBuildLoop(String normalizedPath) {
+        boolean lastSuccess = false;
         try {
             while (true) {
                 synchronized (buildSchedulingLock) {
@@ -122,15 +151,16 @@ public class VueProjectBuilder {
                     pendingBuilds.remove(normalizedPath);
                 }
                 try {
-                    buildProject(normalizedPath);
+                    lastSuccess = buildProject(normalizedPath);
                 } catch (Exception e) {
                     // 异步线程不能把异常抛回主流程，最多记录日志。
                     log.error("异步构建 Vue 项目失败：{}", normalizedPath, e);
+                    lastSuccess = false;
                 }
                 synchronized (buildSchedulingLock) {
                     if (!pendingBuilds.remove(normalizedPath)) {
                         buildingProjects.remove(normalizedPath);
-                        return;
+                        break;
                     }
                     log.info("检测到新的构建请求，使用最新源码重新构建：{}", normalizedPath);
                 }
@@ -141,6 +171,35 @@ public class VueProjectBuilder {
                 pendingBuilds.remove(normalizedPath);
             }
             log.error("Vue 项目构建循环异常终止：{}", normalizedPath, e);
+            lastSuccess = false;
+        } finally {
+            notifyCompletion(normalizedPath, lastSuccess, null);
+        }
+    }
+
+    /**
+     * 触发构建完成回调，并清理登记信息。
+     *
+     * @param projectPath  工程路径，用于取出登记的回调
+     * @param success      最后一轮构建是否成功
+     * @param directCallback 直接指定的回调，优先级高于登记表中的回调
+     */
+    private void notifyCompletion(String projectPath, boolean success, Consumer<Boolean> directCallback) {
+        Consumer<Boolean> callback = directCallback;
+        if (projectPath != null) {
+            Consumer<Boolean> registered = completionCallbacks.remove(projectPath);
+            if (registered != null) {
+                callback = registered;
+            }
+        }
+        if (callback == null) {
+            return;
+        }
+        try {
+            callback.accept(success);
+        } catch (Exception e) {
+            // 回调通常用于更新预览状态，失败只影响前端刷新时机，不能影响构建结果。
+            log.error("Vue 构建完成回调执行失败：{}", projectPath, e);
         }
     }
 
